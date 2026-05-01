@@ -82,26 +82,27 @@ def wiggle_demo():
 
 
 def loop():
-    print("Bun command console ready.")
-    print("Type commands like:")
-    print("  l.f.60.500")
-    print("  l.b.60.500")
-    print("  r.f.60.500")
-    print("  r.b.60.500")
-    print("  all.f.50.1000")
-    print("  all.s")
-    print("Type q to quit.")
+    print("Bun both-motors test starting.")
+
+    send("all.s")
+    time.sleep(1)
+
+    print("Both treads forward for 500 ms.")
+    send("all.f.60.500")
+    time.sleep(1.5)
+
+    send("all.s")
+    time.sleep(1)
+
+    print("Both treads backward for 500 ms.")
+    send("all.b.60.500")
+    time.sleep(1.5)
+
+    send("all.s")
+    print("Bun both-motors test complete. Parking.")
 
     while True:
-        cmd = input("bun> ").strip()
-
-        if cmd.lower() in ("q", "quit", "exit"):
-            send("all.s")
-            print("Stopped motors. Exiting.")
-            break
-
-        if cmd:
-            send(cmd)
+        time.sleep(1)
 
 
 App.run(user_loop=loop)
