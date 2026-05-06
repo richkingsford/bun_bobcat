@@ -1,106 +1,79 @@
-from arduino.app_utils import *
+"""
+Capture one frame from each camera on the bot:
+  OAK-D Lite  — CAM_A color via depthai     (see ../camera_oak_d_lite.txt)
+  HBV HD CAM  — /dev/video2 via V4L2/opencv  (see ../camera_hbv.txt)
+"""
+
+import os
 import time
+from datetime import datetime
 
-# Command format:
-#   l.f.20.750      left forward, 20%, 750 ms
-#   l.b.40.1000     left backward, 40%, 1000 ms
-#   r.f.30.500      right forward, 30%, 500 ms
-#   all.f.50.1200   both forward, 50%, 1200 ms
-#   all.s           stop both
-#
-# Percent sign is allowed:
-#   l.f.20%.750
+import cv2
+import depthai as dai
 
-def send(cmd: str):
-    cmd = cmd.strip().lower().replace(" ", "").replace("%", "")
+from arduino.app_utils import App
 
-    print(f"CMD: {cmd}")
+REPO_PATH = "/app/python"
+HBV_DEVICE = "/dev/video2"
 
-    if cmd in ("stop", "x", "all.s", "a.s"):
-        Bridge.call("drive", 2, 0, 0, 0)
-        return
 
-    parts = cmd.split(".")
+def timestamp_prefix() -> str:
+    now = datetime.now()
+    hour = str(int(now.strftime("%I")))
+    minute = now.strftime("%M")
+    ampm = now.strftime("%p").lower()
+    month = now.strftime("%B")
+    day = str(int(now.strftime("%d")))
+    return f"photo - [{hour}:{minute}{ampm} on {month} {day}]"
 
-    if len(parts) < 2:
-        print("Bad command. Example: l.f.20.750")
-        return
 
-    motor_txt = parts[0]
-    dir_txt = parts[1]
+def capture_oak() -> None:
+    pipeline = dai.Pipeline()
+    cap = dai.ImgFrameCapability()
+    cap.size.fixed((1920, 1080))
+    cap.fps.fixed(10)
+    cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+    q = cam.requestOutput(cap, True).createOutputQueue(maxSize=4, blocking=False)
 
-    if motor_txt in ("l", "left"):
-        motor_code = 0
-    elif motor_txt in ("r", "right"):
-        motor_code = 1
-    elif motor_txt in ("a", "all", "both"):
-        motor_code = 2
+    pipeline.start()
+    frame = None
+    deadline = time.time() + 10
+    while frame is None and time.time() < deadline:
+        pkt = q.tryGet()
+        if pkt is not None:
+            frame = pkt.getCvFrame()
+        else:
+            time.sleep(0.05)
+    pipeline.stop()
+
+    if frame is not None:
+        path = os.path.join(REPO_PATH, f"{timestamp_prefix()} - oak-color.jpg")
+        cv2.imwrite(path, frame)
+        print(f"Saved OAK:  {path} ({os.path.getsize(path):,} bytes)")
     else:
-        print("Bad motor. Use l, r, or all.")
-        return
+        print("ERROR: no frame from OAK-D Lite")
 
-    if dir_txt in ("f", "forward"):
-        dir_code = 1
-    elif dir_txt in ("b", "back", "backward"):
-        dir_code = -1
-    elif dir_txt in ("s", "stop"):
-        Bridge.call("drive", motor_code, 0, 0, 0)
-        return
+
+def capture_hbv() -> None:
+    cap = cv2.VideoCapture(HBV_DEVICE, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    ret, frame = cap.read()
+    cap.release()
+
+    if ret:
+        path = os.path.join(REPO_PATH, f"{timestamp_prefix()} - hbv.jpg")
+        cv2.imwrite(path, frame)
+        print(f"Saved HBV:  {path} ({os.path.getsize(path):,} bytes)")
     else:
-        print("Bad direction. Use f, b, or s.")
-        return
-
-    power = 100
-    duration_ms = 0
-
-    if len(parts) >= 3 and parts[2] != "":
-        power = int(parts[2])
-
-    if len(parts) >= 4 and parts[3] != "":
-        duration_ms = int(parts[3])
-
-    power = max(0, min(100, power))
-    duration_ms = max(0, duration_ms)
-
-    Bridge.call("drive", motor_code, dir_code, power, duration_ms)
-
-
-def wiggle_demo():
-    send("l.f.60.500")
-    time.sleep(0.8)
-
-    send("l.b.60.500")
-    time.sleep(0.8)
-
-    send("r.f.60.500")
-    time.sleep(0.8)
-
-    send("r.b.60.500")
-    time.sleep(0.8)
-
-    send("all.s")
+        print("ERROR: no frame from HBV camera")
 
 
 def loop():
-    print("Bun both-motors test starting.")
-
-    send("all.s")
-    time.sleep(1)
-
-    print("Both treads forward for 500 ms.")
-    send("all.f.60.500")
-    time.sleep(1.5)
-
-    send("all.s")
-    time.sleep(1)
-
-    print("Both treads backward for 500 ms.")
-    send("all.b.60.500")
-    time.sleep(1.5)
-
-    send("all.s")
-    print("Bun both-motors test complete. Parking.")
-
+    print("=== Dual Camera Capture ===")
+    capture_oak()
+    capture_hbv()
+    print("Done.")
     while True:
         time.sleep(1)
 

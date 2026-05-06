@@ -1,0 +1,31 @@
+Camera: OAK-D Lite (Luxonis)
+Device name:  OAK-D-LITE
+MxID:         18443010218BC60F00
+USB vendor:   03e7:2485  (Intel Movidius MyriadX)
+USB speed:    HIGH (USB 2)
+Protocol:     DepthAI (not V4L2 — does NOT appear as /dev/video*)
+
+Sensors:
+  CAM_A  IMX214  4208x3120  COLOR   (capture at 1920x1080 recommended)
+  CAM_B  OV7251   640x480   MONO    (left stereo)
+  CAM_C  OV7251   640x480   MONO    (right stereo)
+
+Python SDK:
+  pip install depthai opencv-python-headless   # already installed at ~/.local
+
+  import depthai as dai, cv2
+  pipeline = dai.Pipeline()
+  cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+  cap = dai.ImgFrameCapability(); cap.size.fixed((1920, 1080)); cap.fps.fixed(10)
+  q = cam.requestOutput(cap, True).createOutputQueue(maxSize=4, blocking=False)
+  pipeline.start()
+  frame = None
+  while frame is None:
+      pkt = q.tryGet()
+      if pkt: frame = pkt.getCvFrame()
+  pipeline.stop()
+  cv2.imwrite("photo.jpg", frame)
+
+Udev rule (required — already installed):
+  /etc/udev/rules.d/80-luxonis-oak.rules
+  SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666", GROUP="users"
