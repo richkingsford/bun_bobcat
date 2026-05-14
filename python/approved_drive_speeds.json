@@ -1,0 +1,153 @@
+{
+  "_note": "Lite motion reference for Bun tread drive. Nonzero wheel powers must come from power_pct and stay at or above the floor; 0 is reserved for intentional stop or pinned-tread steps.",
+  "approved_at": "2026-05-14",
+  "drive_contract": {
+    "motor_codes": {
+      "left": 0,
+      "right": 1,
+      "both": 2
+    },
+    "direction_codes": {
+      "physical_forward": -1,
+      "physical_backward": 1,
+      "stop": 0
+    },
+    "nonzero_power_floor_pct": 20,
+    "nonzero_power_ceiling_pct": 45,
+    "zero_power_allowed_for_stop": true
+  },
+  "timing_ms": {
+    "step": 200,
+    "command": 275,
+    "pause_between_actions": 500,
+    "gradual_turn_duration": 4000
+  },
+  "power_pct": [
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45
+  ],
+  "straight_drive_presets": {
+    "creep": {
+      "left_pct": 20,
+      "right_pct": 20
+    },
+    "easy": {
+      "left_pct": 25,
+      "right_pct": 25
+    },
+    "steady": {
+      "left_pct": 32,
+      "right_pct": 32
+    },
+    "brisk": {
+      "left_pct": 40,
+      "right_pct": 40
+    },
+    "ceiling": {
+      "left_pct": 45,
+      "right_pct": 45
+    }
+  },
+  "turn_presets": {
+    "gentle_arc": {
+      "slow_tread_pct": 20,
+      "fast_tread_pct": 25,
+      "pin_slow_tread_last_steps": 0
+    },
+    "medium_arc": {
+      "slow_tread_pct": 20,
+      "fast_tread_pct": 35,
+      "pin_slow_tread_last_steps": 0
+    },
+    "sharp_finish": {
+      "slow_tread_pct": 20,
+      "fast_tread_pct": 45,
+      "pin_slow_tread_last_steps": 4
+    },
+    "very_sharp": {
+      "slow_tread_pct": 0,
+      "fast_tread_pct": 45,
+      "pin_slow_tread_last_steps": 0
+    },
+    "pivot_turn": {
+      "slow_tread_pct": 45,
+      "slow_tread_direction": "physical_backward",
+      "fast_tread_pct": 45,
+      "fast_tread_direction": "physical_forward",
+      "pin_slow_tread_last_steps": 0
+    }
+  },
+  "gradual_drive_turn": {
+    "current_tested_profile": {
+      "duration_ms": 4000,
+      "step_ms": 200,
+      "slow_tread_hold_pct": 20,
+      "slow_tread_stop_pct": 0,
+      "pin_slow_tread_last_steps": 4,
+      "fast_tread_ramp_pct": [
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        29,
+        30,
+        31,
+        32,
+        34,
+        35,
+        36,
+        37,
+        39,
+        40,
+        41,
+        42,
+        44,
+        45
+      ],
+      "actions": {
+        "forward_left": {
+          "direction": "physical_forward",
+          "slow_tread": "left",
+          "fast_tread": "right"
+        },
+        "back_right": {
+          "direction": "physical_backward",
+          "slow_tread": "left",
+          "fast_tread": "right"
+        }
+      }
+    }
+  },
+  "behavior_hints": [
+    "Use straight_drive_presets when both treads should move together.",
+    "Use gentle_arc or medium_arc before sharp_finish when the robot needs a smoother correction.",
+    "Use 0 power only to stop or deliberately pin a tread for a sharper final turn.",
+    "Mirror left and right tread assignments to produce the opposite turn."
+  ]
+}
