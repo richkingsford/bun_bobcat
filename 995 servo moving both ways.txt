@@ -1,0 +1,27 @@
+#include <Servo.h>
+
+Servo mast;
+unsigned long nextFlip = 0;
+bool state = false;
+
+void setup() {
+  mast.attach(10);
+  mast.write(90);  // neutral start
+  nextFlip = millis() + 500;
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if ((long)(now - nextFlip) >= 0) {
+    state = !state;
+
+    if (state) {
+      mast.write(30);   // mast down (or up depending on your linkage)
+    } else {
+      mast.write(150);  // mast up
+    }
+
+    nextFlip = now + 500;  // flip every 500ms
+  }
+}

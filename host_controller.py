@@ -1,40 +1,32 @@
 """
 host_controller.py — Bun host-side PD controller.
 
-The Arduino Uno Q is treated as a completely dumb motor driver. This script
-owns the PD loop, the vision processing, and the trajectory. It pushes
-framed speed commands over USB serial; the Arduino just decodes them.
+The Arduino UNO Q is treated as a motor driver. This script owns the PD loop,
+the vision processing, and the trajectory. By default it talks to the UNO Q
+through the App Lab RPC router, matching sketch/sketch.ino:
 
-Pipeline each 50 ms tick:
+    Bridge.notify("drive_pair", L, R)
 
-    [vision: x_off, y_off, distance]  ->  PD  ->  L%, R%  ->  "<L,R>\\n"
-
-Serial protocol (must match sketch.ino):
-    <L,R>\\n         L,R are signed decimal integers in [-100, 100]:
-                       > 0  forward at |x|% (sign-mapped on Arduino)
-                       < 0  reverse at |x|%
-                       = 0  coast
+where L and R are signed decimal integers in [-100, 100]:
+    > 0  forward at |x|% (sign-mapped on Arduino)
+    < 0  reverse at |x|%
+    = 0  coast
 
 Vision is supplied by VisionStub by default so the script is runnable
 without a camera. To go live, swap VisionStub for an object exposing
 .read() -> (x_off_mm, y_off_mm, distance_mm) in the robot frame.
 
 Usage:
-    python3 host_controller.py --port /dev/ttyACM0
-    python3 host_controller.py --port /dev/ttyACM0 --target 400,250
-    python3 host_controller.py --no-serial          # dry-run, no Arduino
+    python3 host_controller.py
+    python3 host_controller.py --target 400,250
+    python3 host_controller.py --dry-run
+    python3 host_controller.py --transport serial --port /dev/ttyACM0
 """
 
 import argparse
 import math
-import sys
+from pathlib import Path
 import time
-
-try:
-    import serial
-except ImportError:
-    print("pyserial is required:  pip install pyserial", file=sys.stderr)
-    raise
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +44,9 @@ KD_H = 35.0
 
 CTRL_HZ = 20
 
-# Serial transport
+# Transports
+DEFAULT_ROUTER_SOCKET = "/var/run/arduino-router.sock"
+RPC_TIMEOUT_S         = 2.0
 DEFAULT_PORT         = "/dev/ttyACM0"
 SERIAL_BAUD          = 115200
 SERIAL_TIMEOUT_S     = 0.05
@@ -146,8 +140,57 @@ class VisionStub:
 
 
 # ---------------------------------------------------------------------------
-# Serial transport with auto-reconnect
+# Motor transports
 # ---------------------------------------------------------------------------
+class RpcLink:
+    def __init__(self, socket_path=DEFAULT_ROUTER_SOCKET):
+        self.socket_path = socket_path
+        self.bridge = None
+
+    def connect(self) -> bool:
+        if self.bridge is not None:
+            return True
+
+        if not Path(self.socket_path).exists():
+            print(f"[rpc] router socket not found at {self.socket_path}")
+            return False
+
+        try:
+            from arduino.app_utils import Bridge
+        except ImportError as e:
+            print(f"[rpc] arduino.app_utils is unavailable: {e}")
+            return False
+
+        try:
+            Bridge.call("drive_pair", 0, 0, timeout=RPC_TIMEOUT_S)
+        except ValueError as e:
+            print(f"[rpc] UNO Q sketch does not expose drive_pair: {e}")
+            print("[rpc] upload the updated sketch/sketch.ino, then retry.")
+            return False
+        except (TimeoutError, RuntimeError, OSError) as e:
+            print(f"[rpc] connection check failed: {e}")
+            return False
+
+        self.bridge = Bridge
+        print(f"[rpc] connected through {self.socket_path}; drive_pair is ready")
+        return True
+
+    def send(self, l_pct, r_pct):
+        if self.bridge is None:
+            raise RuntimeError("not connected")
+        self.bridge.notify("drive_pair", int(l_pct), int(r_pct))
+
+    def coast(self):
+        try:
+            if self.bridge is not None:
+                self.bridge.notify("drive_pair", 0, 0)
+        except Exception:
+            pass
+
+    def close(self):
+        self.bridge = None
+
+
 class SerialLink:
     def __init__(self, port, baud=SERIAL_BAUD):
         self.port = port
@@ -155,6 +198,12 @@ class SerialLink:
         self.ser  = None
 
     def connect(self) -> bool:
+        try:
+            import serial
+        except ImportError as e:
+            print(f"[serial] pyserial is required: {e}")
+            return False
+
         try:
             self.ser = serial.Serial(
                 self.port, self.baud,
@@ -174,6 +223,8 @@ class SerialLink:
             return False
 
     def send(self, l_pct, r_pct):
+        import serial
+
         if self.ser is None:
             raise serial.SerialException("not connected")
         self.ser.write(f"<{l_pct},{r_pct}>\n".encode("ascii"))
@@ -194,19 +245,44 @@ class SerialLink:
             self.ser = None
 
 
+class DryRunLink:
+    def connect(self) -> bool:
+        print("[dry-run] not sending commands to hardware")
+        return True
+
+    def send(self, l_pct, r_pct):
+        return None
+
+    def coast(self):
+        return None
+
+    def close(self):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default=DEFAULT_PORT,
-                    help=f"serial port (default {DEFAULT_PORT})")
+    ap.add_argument("--transport", choices=("rpc", "serial", "dry-run"),
+                    default=None,
+                    help="motor transport; default is rpc unless --port or --dry-run is used")
+    ap.add_argument("--port", default=None,
+                    help=f"legacy USB serial port, e.g. {DEFAULT_PORT}")
     ap.add_argument("--baud", type=int, default=SERIAL_BAUD)
+    ap.add_argument("--router-socket", default=DEFAULT_ROUTER_SOCKET,
+                    help=f"App Lab router socket (default {DEFAULT_ROUTER_SOCKET})")
     ap.add_argument("--target", default="400,250",
                     help="virtual vision target in mm, format: x,y")
     ap.add_argument("--no-serial", action="store_true",
+                    help="deprecated alias for --dry-run")
+    ap.add_argument("--dry-run", action="store_true",
                     help="run the PD loop with no Arduino attached")
     args = ap.parse_args()
+
+    if args.no_serial:
+        args.dry_run = True
 
     try:
         tx, ty = (float(v) for v in args.target.split(","))
@@ -215,19 +291,33 @@ def main():
 
     pd     = PdController()
     vision = VisionStub((tx, ty))
-    link   = SerialLink(args.port, args.baud)
 
-    if not args.no_serial:
-        # Don't enter the loop blind. Sending phantom commands while
-        # disconnected would only hide bugs; the Arduino watchdog will
-        # coast the motors after CMD_TIMEOUT_MS while we're down.
-        while not link.connect():
-            print(f"[serial] retrying in {RECONNECT_WAIT_S:.1f}s "
-                  "(Ctrl-C to abort)...")
-            try:
-                time.sleep(RECONNECT_WAIT_S)
-            except KeyboardInterrupt:
-                print(); return
+    transport = args.transport
+    if transport is None:
+        if args.dry_run:
+            transport = "dry-run"
+        elif args.port:
+            transport = "serial"
+        else:
+            transport = "rpc"
+
+    if transport == "rpc":
+        link = RpcLink(args.router_socket)
+    elif transport == "serial":
+        link = SerialLink(args.port or DEFAULT_PORT, args.baud)
+    else:
+        link = DryRunLink()
+
+    # Don't enter the loop blind. Sending phantom commands while disconnected
+    # would only hide bugs; the Arduino watchdog coasts the motors while down.
+    while not link.connect():
+        print(f"[{transport}] retrying in {RECONNECT_WAIT_S:.1f}s "
+              "(Ctrl-C to abort)...")
+        try:
+            time.sleep(RECONNECT_WAIT_S)
+        except KeyboardInterrupt:
+            print()
+            return
 
     period = 1.0 / CTRL_HZ
     next_t = time.monotonic()
@@ -245,11 +335,11 @@ def main():
             x_off, y_off, dist = vision.read()
             l_pct, r_pct = pd.step(x_off, y_off, dist, dt)
 
-            if not args.no_serial:
+            if transport != "dry-run":
                 try:
                     link.send(l_pct, r_pct)
-                except (serial.SerialException, OSError) as e:
-                    print(f"[serial] write failed: {e} — reconnecting...")
+                except Exception as e:
+                    print(f"[{transport}] write failed: {e} — reconnecting...")
                     link.close()
                     while not link.connect():
                         time.sleep(RECONNECT_WAIT_S)

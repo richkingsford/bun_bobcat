@@ -1,5 +1,6 @@
 from arduino.app_utils import *
 import time
+import random
 
 # Command format:
 #   l.f.20.750      left forward, 20%, 750 ms
@@ -65,6 +66,23 @@ def send(cmd: str):
     Bridge.call("drive", motor_code, dir_code, power, duration_ms)
 
 
+def go_forward(duration_ms: int = 2000, power: int = 100):
+    send(f"all.f.{power}.{duration_ms}")
+    time.sleep(duration_ms / 1000 + 0.1)
+    send("all.s")
+
+
+def random_move(duration_ms: int = 400):
+    left_dir  = random.choice(["f", "b"])
+    right_dir = random.choice(["f", "b"])
+    left_pwr  = random.randint(40, 100)
+    right_pwr = random.randint(40, 100)
+    send(f"l.{left_dir}.{left_pwr}.{duration_ms}")
+    send(f"r.{right_dir}.{right_pwr}.{duration_ms}")
+    time.sleep(duration_ms / 1000 + 0.1)
+    send("all.s")
+
+
 def wiggle_demo():
     send("l.f.60.500")
     time.sleep(0.8)
@@ -82,6 +100,8 @@ def wiggle_demo():
 
 
 def loop():
+    print("Driving forward 2 s to close gap...")
+    go_forward(2000)
     print("Bun command console ready.")
     print("Type commands like:")
     print("  l.f.60.500")
