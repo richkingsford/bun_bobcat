@@ -27,11 +27,11 @@ from host_controller import (  # noqa: E402
 
 DEFAULT_STATUS_URL = "http://127.0.0.1:8080/status"
 DEFAULT_TARGET_X_MM = 0
-DEFAULT_TARGET_Y_MM = 20
-DEFAULT_TARGET_DIST_MM = 200
-DEFAULT_X_DEADBAND_MM = 12
-DEFAULT_Y_DEADBAND_MM = 18
-DEFAULT_DIST_DEADBAND_MM = 18
+DEFAULT_TARGET_Y_MM = 0
+DEFAULT_TARGET_DIST_MM = 30
+DEFAULT_X_DEADBAND_MM = 15
+DEFAULT_Y_DEADBAND_MM = 15
+DEFAULT_DIST_DEADBAND_MM = 15
 DEFAULT_MIN_CONFIDENCE = 55
 DEFAULT_POWER = 70
 DEFAULT_MAST_POWER = 70
@@ -44,6 +44,7 @@ DEFAULT_MAST_MS_PER_MM = 1.4
 DEFAULT_DIST_MS_PER_MM = 1.2
 DEFAULT_SAMPLE_PAUSE_S = 0.08
 DEFAULT_MAX_SECONDS = 5.0
+DEFAULT_PREFLIGHT_SECONDS = 2.0
 DEFAULT_SETTLED_SAMPLES = 3
 DEFAULT_NO_PROGRESS_SAMPLES = 6
 DEFAULT_PROGRESS_EPSILON_MM = 8
@@ -120,12 +121,47 @@ def send_for(link, left, right, mast, seconds):
     link.coast()
 
 
+def wait_for_confident_brick(vision, seconds, pause_s):
+    deadline = time.monotonic() + seconds
+    last_error = None
+    misses = 0
+
+    while time.monotonic() < deadline:
+        try:
+            reading = vision.read()
+        except RuntimeError as exc:
+            last_error = str(exc)
+            time.sleep(pause_s)
+            continue
+
+        if reading is not None:
+            print(
+                f"[align] vision gate passed: x={reading.x_mm:+d}mm "
+                f"y={reading.y_mm:+d}mm dist={reading.dist_mm}mm "
+                f"conf={reading.confidence}% src={reading.dist_source}"
+            )
+            return reading
+
+        misses += 1
+        time.sleep(pause_s)
+
+    reason = last_error or f"no confident brick reading after {misses} samples"
+    print(f"[align] aborting before motion: {reason}")
+    return None
+
+
 def align(args):
     vision = BrickVisionClient(
         args.vision_url,
         timeout_s=args.vision_timeout,
         min_confidence=args.min_confidence,
     )
+
+    if args.require_vision and wait_for_confident_brick(
+        vision, args.preflight_seconds, args.sample_pause
+    ) is None:
+        return 4
+
     transport, link = make_link(args)
 
     if not link.connect():
@@ -320,6 +356,10 @@ def main():
                         help="pause after each pulse before reading vision again")
     parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS,
                         help="alignment test timeout")
+    parser.add_argument("--preflight-seconds", type=float, default=DEFAULT_PREFLIGHT_SECONDS,
+                        help="seconds to wait for a confident brick reading before motors are opened")
+    parser.add_argument("--allow-blind-start", action="store_true",
+                        help="open the motor transport even if vision is not ready")
     parser.add_argument("--reverse-turn", action="store_true",
                         help="flip left/right spin direction if hardware is reversed")
     parser.add_argument("--reverse-drive", action="store_true",
@@ -342,6 +382,9 @@ def main():
         parser.error("pulse bounds must be positive and max >= min")
     if args.sample_pause < 0 or args.max_seconds <= 0:
         parser.error("--sample-pause must be non-negative and --max-seconds positive")
+    if args.preflight_seconds < 0:
+        parser.error("--preflight-seconds must be non-negative")
+    args.require_vision = not args.allow_blind_start
 
     return align(args)
 

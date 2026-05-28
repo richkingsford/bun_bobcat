@@ -5,11 +5,12 @@ Closes a 20 Hz PD loop around live OAK-D Lite millimeter telemetry served by
 python/brick_vision/stream.py at http://127.0.0.1:8080/status, and streams the
 resulting wheel commands as ASCII frames
 
-    <L,R>\n
+    <L,R,M>\n
 
 over USB serial at 115200 baud to the Uno Q (matches sketch/sketch.ino).
 L and R are signed integers in [-100, 100]; sign maps to direction on the
-sketch, magnitude maps to PWM duty.
+sketch, magnitude maps to PWM duty. M is the mast servo command and is kept
+at 0 by this controller.
 
 If the brick is lost — no detection, confidence below threshold, invalid
 spatial fix, or the HTTP poll fails — the controller transmits a coast
@@ -22,10 +23,10 @@ tuned for ζ ≈ 1.5 (slightly overdamped) on both distance and heading loops
 (see pd_simulator.py header for derivation).
 
 Usage:
-    python3 host_controller.py                        # serial @ /dev/ttyACM0
-    python3 host_controller.py --port /dev/ttyACM1
+    python3 host_controller.py                        # RouterBridge RPC
+    python3 host_controller.py --transport serial --port /dev/ttyACM1
     python3 host_controller.py --vision-url http://10.0.0.1:8080/status
-    python3 host_controller.py --transport rpc        # legacy App Lab bridge
+    python3 host_controller.py --transport rpc        # explicit RouterBridge
     python3 host_controller.py --dry-run              # no hardware, no motion
     python3 host_controller.py --no-vision            # smoke test, will coast
 """
@@ -215,7 +216,7 @@ class LiveBrickVision:
 # Motor transports
 # ---------------------------------------------------------------------------
 class SerialLink:
-    """USB serial transport. Streams <L,R>\n frames at 115200 baud to the
+    """USB serial transport. Streams <L,R,M>\n frames at 115200 baud to the
     Uno Q. This is the low-latency default."""
     def __init__(self, port, baud=SERIAL_BAUD):
         self.port = port
@@ -247,16 +248,16 @@ class SerialLink:
             self.ser = None
             return False
 
-    def send(self, l_pct, r_pct):
+    def send(self, l_pct, r_pct, m_pct=0):
         import serial
         if self.ser is None:
             raise serial.SerialException("not connected")
-        self.ser.write(f"<{int(l_pct)},{int(r_pct)}>\n".encode("ascii"))
+        self.ser.write(f"<{int(l_pct)},{int(r_pct)},{int(m_pct)}>\n".encode("ascii"))
 
     def coast(self):
         try:
             if self.ser is not None:
-                self.ser.write(b"<0,0>\n")
+                self.ser.write(b"<0,0,0>\n")
                 self.ser.flush()
         except Exception:
             pass
@@ -270,9 +271,8 @@ class SerialLink:
 
 
 class RpcLink:
-    """Legacy App Lab RouterBridge transport. Kept for compatibility with
-    older RPC-flavoured firmwares; the SerialLink is the low-latency path
-    and the new default."""
+    """App Lab RouterBridge transport. Streams signed drive_triple values to
+    the known-good Bun sketch."""
     def __init__(self, socket_path=DEFAULT_ROUTER_SOCKET):
         self.socket_path = socket_path
         self.bridge = None
@@ -289,9 +289,9 @@ class RpcLink:
             print(f"[rpc] arduino.app_utils unavailable: {e}")
             return False
         try:
-            Bridge.call("drive_pair", 0, 0, timeout=RPC_TIMEOUT_S)
+            Bridge.call("drive_triple", 0, 0, 0, timeout=RPC_TIMEOUT_S)
         except ValueError as e:
-            print(f"[rpc] Uno Q sketch lacks drive_pair: {e}")
+            print(f"[rpc] Uno Q sketch lacks drive_triple: {e}")
             return False
         except (TimeoutError, RuntimeError, OSError) as e:
             print(f"[rpc] connection check failed: {e}")
@@ -303,12 +303,12 @@ class RpcLink:
     def send(self, l_pct, r_pct):
         if self.bridge is None:
             raise RuntimeError("not connected")
-        self.bridge.notify("drive_pair", int(l_pct), int(r_pct))
+        self.bridge.notify("drive_triple", int(l_pct), int(r_pct), 0)
 
     def coast(self):
         try:
             if self.bridge is not None:
-                self.bridge.notify("drive_pair", 0, 0)
+                self.bridge.notify("drive_triple", 0, 0, 0)
         except Exception:
             pass
 
@@ -339,7 +339,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--transport", choices=("serial", "rpc", "dry-run"),
                     default=None,
-                    help="motor transport; default = serial (rpc still supported)")
+                    help="motor transport; default = rpc")
     ap.add_argument("--port", default=None,
                     help=f"USB serial port (default {DEFAULT_PORT})")
     ap.add_argument("--baud", type=int, default=SERIAL_BAUD)
@@ -359,8 +359,9 @@ def main():
     vision = None if args.no_vision else LiveBrickVision(
         args.vision_url, args.min_confidence)
 
-    # Default to serial; --dry-run wins if both are unspecified together.
-    transport = args.transport or ("dry-run" if args.dry_run else "serial")
+    # Default to the known-good RouterBridge sketch; --dry-run wins if both
+    # are unspecified together.
+    transport = args.transport or ("dry-run" if args.dry_run else "rpc")
     if transport == "serial":
         link = SerialLink(args.port or DEFAULT_PORT, args.baud)
     elif transport == "rpc":

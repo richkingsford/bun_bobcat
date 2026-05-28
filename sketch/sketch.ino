@@ -1,238 +1,237 @@
-/*
- * sketch.ino - Bun dumb serial receiver (Arduino Uno Q).
- *
- * Pure motor receiver. All control logic (vision, PD, trajectory) lives in
- * host_controller.py on the Linux host. This sketch listens on Serial at
- * 115200 baud for ASCII frames:
- *
- *     <L,R>\n
- *
- * where L and R are signed decimal integers in [-100, 100]:
- *     > 0   forward at |x|%
- *     < 0   reverse at |x|%
- *     == 0  coast
- *
- * Values outside [-100, 100] are clamped. Malformed frames are dropped
- * silently; the 500 ms watchdog will coast the motors if they keep coming.
- *
- * Motor wiring (unchanged from the App Lab import — verified working on
- * this physical Bun; do NOT swap to DRV8912 SPI, this robot uses simple
- * H-bridge digital pins):
- *
- *     Left tread:  D6 (forward) / D7 (reverse)
- *     Right tread: D8 (forward) / D9 (reverse)
- *     Mast servo:  D10 continuous servo, held at SERVO_NEUTRAL (the
- *                  serial protocol is intentionally drive-only; if mast
- *                  control returns, extend the frame to <L,R,M> rather
- *                  than re-introducing an RPC path).
- *
- * Motor control:
- *     - Software PWM at PWM_PERIOD_US (200 Hz) for proportional speed.
- *     - KICK_MS of full-power drive on direction change / startup to
- *       overcome stiction; the kick is suppressed when |speed| == 100.
- *
- * Safety:
- *     - 500 ms watchdog: if no valid frame arrives within CMD_TIMEOUT_MS,
- *       both treads coast. The mast is already held at neutral so no
- *       extra action is needed there.
- */
-
+#include "Arduino_RouterBridge.h"
 #include "/home/arduino/Arduino/libraries/Arduino_HardwareServo/src/Arduino_HardwareServo.h"
 #include "/home/arduino/Arduino/libraries/Arduino_HardwareServo/src/HardwareServo.cpp"
 #include "/home/arduino/Arduino/libraries/Arduino_HardwareServo/src/HardwareServo_zephyr.cpp"
 
-// ---------- Wiring (matches the existing physical robot) ----------------
+// Bun robot bridge-controlled tread driver with D10 mast servo.
+//
+// Tread solution is intentionally carried over from "Bun sketch.txt":
+//   Left tread:  pins 6 / 7
+//   Right tread: pins 8 / 9
+//   Bridge.call("drive", motorCode, dirCode, power, durationMs)
+//
+// Mast solution is intentionally carried over from
+// "995 servo moving both ways.txt":
+//   mast.attach(10)
+//   mast.write(90) neutral
+//   mast.write(30) one direction
+//   mast.write(150) the other direction
+
 const int LEFT_A   = 6;
 const int LEFT_B   = 7;
 const int RIGHT_A  = 8;
 const int RIGHT_B  = 9;
 const int MAST_PIN = 10;
 
-const int SERVO_NEUTRAL = 90;
+const int MAST_NEG     = 30;
+const int MAST_NEUTRAL = 90;
+const int MAST_POS     = 150;
 
-// ---------- Motor service constants -------------------------------------
-const uint32_t      CMD_TIMEOUT_MS = 500;    // watchdog window
-const unsigned long PWM_PERIOD_US  = 5000;   // 200 Hz software PWM
-const unsigned long KICK_MS        = 120;    // stiction-breaking kick window
+const unsigned long PWM_PERIOD_US = 5000; // 200 Hz software PWM
+const unsigned long KICK_MS = 120;        // full-power startup kick
 
-// ---------- Serial / parser ---------------------------------------------
-const uint32_t SERIAL_BAUD  = 115200;
-const size_t   RX_BUF_MAX   = 32;
-
-char     rxBuf[RX_BUF_MAX];
-size_t   rxLen     = 0;
-bool     inFrame   = false;
-uint32_t lastCmdMs = 0;
-
-HardwareServo mast;
-
-struct Tread {
+struct Motor {
   int pinA;
   int pinB;
-  int speed;
-  unsigned long kickUntilMs;
+  int dir;                 // 1 forward, -1 backward, 0 stop
+  int power;               // 0-100
+  unsigned long stopAtMs;  // 0 means no timed stop
+  unsigned long kickUntil;
 };
 
-Tread leftTread  = {LEFT_A,  LEFT_B,  0, 0};
-Tread rightTread = {RIGHT_A, RIGHT_B, 0, 0};
+Motor leftMotor  = { LEFT_A, LEFT_B, 0, 0, 0, 0 };
+Motor rightMotor = { RIGHT_A, RIGHT_B, 0, 0, 0, 0 };
+HardwareServo mast;
 
-
-// ------------------------------------------------------------------------
-// Motor primitives (carried over from the RPC sketch; this is the part that
-// is known-working on the physical robot — only the front-end changes).
-// ------------------------------------------------------------------------
-static inline int clampSpeed(int speed) {
-  return max(-100, min(100, speed));
-}
-
-void driveHBridgeRaw(int pinA, int pinB, int speed, bool on) {
-  if (!on || speed == 0) {
-    digitalWrite(pinA, LOW);
-    digitalWrite(pinB, LOW);
-    return;
-  }
-  if (speed > 0) {
-    digitalWrite(pinA, HIGH);
-    digitalWrite(pinB, LOW);
-  } else {
-    digitalWrite(pinA, LOW);
-    digitalWrite(pinB, HIGH);
-  }
-}
-
-void setTread(Tread &tread, int speed) {
-  speed = clampSpeed(speed);
-  bool startingOrReversing =
-      (tread.speed == 0) || ((tread.speed > 0) != (speed > 0));
-
-  if (speed == 0) {
-    tread.speed = 0;
-    tread.kickUntilMs = 0;
-    driveHBridgeRaw(tread.pinA, tread.pinB, 0, false);
-    return;
-  }
-
-  tread.speed = speed;
-  if (startingOrReversing && abs(speed) < 100) {
-    // Kick-start: gear stiction won't yield at low duty unless we briefly
-    // pin the bridge at full power. Skipped at 100% (already full).
-    tread.kickUntilMs = millis() + KICK_MS;
-  }
-}
-
-void serviceTread(Tread &tread) {
-  int magnitude = abs(tread.speed);
-  if (magnitude <= 0) {
-    driveHBridgeRaw(tread.pinA, tread.pinB, 0, false);
-    return;
-  }
-
-  if (magnitude >= 100 || millis() < tread.kickUntilMs) {
-    driveHBridgeRaw(tread.pinA, tread.pinB, tread.speed, true);
-    return;
-  }
-
-  unsigned long phase  = micros() % PWM_PERIOD_US;
-  unsigned long onTime = (PWM_PERIOD_US * (unsigned long)magnitude) / 100;
-  driveHBridgeRaw(tread.pinA, tread.pinB, tread.speed, phase < onTime);
-}
-
-void applyDrive(int left, int right) {
-  setTread(leftTread,  left);
-  setTread(rightTread, right);
-  // Mast is held at SERVO_NEUTRAL; nothing to update here.
-}
-
-
-// ------------------------------------------------------------------------
-// Frame parser: '<' opens a frame, '>' closes it. Characters outside a
-// frame are discarded. Inside a frame: split on the first comma, atoi
-// each half.
-// ------------------------------------------------------------------------
-void handleFrame(char *body) {
-  char *comma = strchr(body, ',');
-  if (!comma) {
-    return;  // malformed; drop silently, watchdog will catch sustained gaps
-  }
-  *comma = '\0';
-  int l = clampSpeed(atoi(body));
-  int r = clampSpeed(atoi(comma + 1));
-  applyDrive(l, r);
-  lastCmdMs = millis();
-}
-
-void serialPoll() {
-  while (Serial.available() > 0) {
-    char c = (char)Serial.read();
-
-    if (c == '<') {                  // frame start (also resets buffer)
-      inFrame = true;
-      rxLen   = 0;
-      continue;
-    }
-
-    if (!inFrame) {
-      continue;                      // noise outside frames is discarded
-    }
-
-    if (c == '>') {                  // frame end
-      inFrame = false;
-      if (rxLen < RX_BUF_MAX) {
-        rxBuf[rxLen] = '\0';
-        handleFrame(rxBuf);
-      }
-      rxLen = 0;
-      continue;
-    }
-
-    if (rxLen < RX_BUF_MAX - 1) {
-      rxBuf[rxLen++] = c;
-    } else {
-      // Frame too long — abort it, wait for next '<'.
-      inFrame = false;
-      rxLen   = 0;
-    }
-  }
-}
-
-
-// ------------------------------------------------------------------------
-// Watchdog: coast both treads if no valid frame arrives within
-// CMD_TIMEOUT_MS. Cheaper-than-correct path: we only re-issue a coast
-// when the treads aren't already coasted.
-// ------------------------------------------------------------------------
-void watchdog() {
-  if (millis() - lastCmdMs > CMD_TIMEOUT_MS) {
-    if (leftTread.speed != 0 || rightTread.speed != 0) {
-      applyDrive(0, 0);
-    }
-  }
-}
-
-
-// ------------------------------------------------------------------------
-// Arduino entry points
-// ------------------------------------------------------------------------
 void setup() {
-  pinMode(LEFT_A,  OUTPUT);
-  pinMode(LEFT_B,  OUTPUT);
+  pinMode(LEFT_A, OUTPUT);
+  pinMode(LEFT_B, OUTPUT);
   pinMode(RIGHT_A, OUTPUT);
   pinMode(RIGHT_B, OUTPUT);
 
+  stopAll();
   mast.attach(MAST_PIN);
-  mast.write(SERVO_NEUTRAL);
+  mast.write(MAST_NEUTRAL);
 
-  applyDrive(0, 0);
+  Monitor.begin();
+  Bridge.begin();
 
-  Serial.begin(SERIAL_BAUD);
-  lastCmdMs = millis();
+  Bridge.provide_safe("drive", drive);
+  Bridge.provide_safe("mast", driveMast);
+  Bridge.provide_safe("drive_mast", driveMast);
+  Bridge.provide_safe("drive_triple", driveTriple);
 
-  Serial.println("Bun dumb-serial receiver ready. Send <L,R> at 115200.");
+  Monitor.println("Bun Bridge tread + mast control ready.");
 }
 
 void loop() {
-  serialPoll();
-  watchdog();
-  serviceTread(leftTread);
-  serviceTread(rightTread);
+  unsigned long now = millis();
+
+  checkTimedStop(leftMotor, now);
+  checkTimedStop(rightMotor, now);
+
+  serviceMotor(leftMotor);
+  serviceMotor(rightMotor);
+}
+
+void drive(int motorCode, int dirCode, int power, int durationMs) {
+  power = constrain(power, 0, 100);
+
+  Monitor.print("drive motorCode=");
+  Monitor.print(motorCode);
+  Monitor.print(" dirCode=");
+  Monitor.print(dirCode);
+  Monitor.print(" power=");
+  Monitor.print(power);
+  Monitor.print(" durationMs=");
+  Monitor.println(durationMs);
+
+  if (dirCode != 1 && dirCode != -1 && dirCode != 0) {
+    Monitor.println("Bad dirCode.");
+    return;
+  }
+
+  if (durationMs < 0) {
+    durationMs = 0;
+  }
+
+  if (motorCode == 0) {
+    setMotor(leftMotor, dirCode, power, durationMs);
+  } else if (motorCode == 1) {
+    setMotor(rightMotor, dirCode, power, durationMs);
+  } else if (motorCode == 2) {
+    setMotor(leftMotor, dirCode, power, durationMs);
+    setMotor(rightMotor, dirCode, power, durationMs);
+  } else {
+    Monitor.println("Bad motorCode.");
+  }
+}
+
+void driveMast(int dirCode) {
+  Monitor.print("mast dirCode=");
+  Monitor.println(dirCode);
+
+  if (dirCode > 0) {
+    mast.write(MAST_POS);
+  } else if (dirCode < 0) {
+    mast.write(MAST_NEG);
+  } else {
+    mast.write(MAST_NEUTRAL);
+  }
+}
+
+void driveTriple(int leftPct, int rightPct, int mastPct) {
+  setSignedMotor(leftMotor, leftPct);
+  setSignedMotor(rightMotor, rightPct);
+  driveMast(mastPct);
+}
+
+void setSignedMotor(Motor &m, int signedPower) {
+  signedPower = constrain(signedPower, -100, 100);
+  if (signedPower > 0) {
+    setMotor(m, 1, signedPower, 0);
+  } else if (signedPower < 0) {
+    setMotor(m, -1, -signedPower, 0);
+  } else {
+    setMotor(m, 0, 0, 0);
+  }
+}
+
+void setMotor(Motor &m, int dir, int power, int durationMs) {
+  bool startingOrChanging = (m.dir != dir || m.power == 0);
+
+  if (dir == 0 || power == 0) {
+    m.dir = 0;
+    m.power = 0;
+    m.stopAtMs = 0;
+    m.kickUntil = 0;
+    stopMotor(m);
+    return;
+  }
+
+  m.dir = dir;
+  m.power = power;
+
+  if (durationMs > 0) {
+    m.stopAtMs = millis() + (unsigned long)durationMs;
+  } else {
+    m.stopAtMs = 0;
+  }
+
+  if (startingOrChanging && power < 100) {
+    m.kickUntil = millis() + KICK_MS;
+  } else {
+    m.kickUntil = 0;
+  }
+}
+
+void checkTimedStop(Motor &m, unsigned long now) {
+  if (m.stopAtMs != 0 && timeReached(now, m.stopAtMs)) {
+    m.dir = 0;
+    m.power = 0;
+    m.stopAtMs = 0;
+    m.kickUntil = 0;
+    stopMotor(m);
+  }
+}
+
+bool timeReached(unsigned long now, unsigned long target) {
+  return (long)(now - target) >= 0;
+}
+
+void serviceMotor(Motor &m) {
+  if (m.dir == 0 || m.power <= 0) {
+    stopMotor(m);
+    return;
+  }
+
+  bool fullPowerKick = millis() < m.kickUntil;
+
+  if (m.power >= 100 || fullPowerKick) {
+    driveMotorRaw(m, true);
+    return;
+  }
+
+  unsigned long phase = micros() % PWM_PERIOD_US;
+  unsigned long onTime = (PWM_PERIOD_US * m.power) / 100;
+  bool pwmOn = phase < onTime;
+
+  driveMotorRaw(m, pwmOn);
+}
+
+void driveMotorRaw(Motor &m, bool on) {
+  if (!on) {
+    stopMotor(m);
+    return;
+  }
+
+  if (m.dir == 1) {
+    digitalWrite(m.pinA, HIGH);
+    digitalWrite(m.pinB, LOW);
+  } else if (m.dir == -1) {
+    digitalWrite(m.pinA, LOW);
+    digitalWrite(m.pinB, HIGH);
+  } else {
+    stopMotor(m);
+  }
+}
+
+void stopMotor(Motor &m) {
+  digitalWrite(m.pinA, LOW);
+  digitalWrite(m.pinB, LOW);
+}
+
+void stopAll() {
+  leftMotor.dir = 0;
+  leftMotor.power = 0;
+  leftMotor.stopAtMs = 0;
+  leftMotor.kickUntil = 0;
+
+  rightMotor.dir = 0;
+  rightMotor.power = 0;
+  rightMotor.stopAtMs = 0;
+  rightMotor.kickUntil = 0;
+
+  stopMotor(leftMotor);
+  stopMotor(rightMotor);
 }

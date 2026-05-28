@@ -22,6 +22,8 @@ JPEG_QUALITY = 82
 STREAM_SLEEP_S = 0.02
 GREEN_LOWER_HSV = np.array([38, 65, 45])
 GREEN_UPPER_HSV = np.array([95, 255, 255])
+BODY_MIN_S = 145
+BODY_MIN_V = 105
 MIN_BRICK_AREA = 4000
 HEX_SAMPLE_COUNT = 12
 HEX_SAMPLE_PERIOD_S = 2.0
@@ -313,9 +315,85 @@ class BrickDetector:
         self.hex_colors = []
         self.last_hex_sample_t = 0.0
 
-    def _sample_hex_colors(self, frame, mask, contour):
+    def _largest_true_run(self, values):
+        best_start = None
+        best_len = 0
+        start = None
+
+        for index, value in enumerate(values):
+            if value:
+                if start is None:
+                    start = index
+            elif start is not None:
+                run_len = index - start
+                if run_len > best_len:
+                    best_start = start
+                    best_len = run_len
+                start = None
+
+        if start is not None:
+            run_len = len(values) - start
+            if run_len > best_len:
+                best_start = start
+                best_len = run_len
+
+        if best_start is None:
+            return None
+        return best_start, best_start + best_len
+
+    def _solid_body_bbox(self, mask, contour, hsv=None):
+        x, y, w, h = cv2.boundingRect(contour)
+        roi_green = mask[y:y + h, x:x + w]
+        silhouette = np.zeros_like(roi_green)
+        cv2.drawContours(silhouette, [contour - np.array([x, y])], -1, 255, cv2.FILLED)
+        body = cv2.bitwise_and(roi_green, silhouette)
+        body = cv2.morphologyEx(body, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+        core = body
+        if hsv is not None:
+            hsv_roi = hsv[y:y + h, x:x + w]
+            strong_color = (
+                (hsv_roi[:, :, 1] >= BODY_MIN_S)
+                & (hsv_roi[:, :, 2] >= BODY_MIN_V)
+            )
+            core = np.zeros_like(body)
+            core[(body > 0) & strong_color] = 255
+            core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+            if cv2.countNonZero(core) < 50:
+                core = body
+
+        row_counts = np.count_nonzero(core, axis=1)
+        col_counts = np.count_nonzero(core, axis=0)
+        if row_counts.size == 0 or col_counts.size == 0 or row_counts.max() == 0 or col_counts.max() == 0:
+            return x, y, w, h, int(cv2.contourArea(contour))
+
+        row_threshold = max(8, int(round(row_counts.max() * 0.22)))
+        col_threshold = max(8, int(round(col_counts.max() * 0.22)))
+        good_rows = row_counts >= row_threshold
+        good_cols = col_counts >= col_threshold
+
+        row_run = self._largest_true_run(good_rows)
+        col_run = self._largest_true_run(good_cols)
+        if row_run is None or col_run is None:
+            return x, y, w, h, int(np.count_nonzero(body))
+
+        pad = 3
+        y0 = max(0, row_run[0] - pad)
+        y1 = min(h, row_run[1] + pad)
+        x0 = max(0, col_run[0] - pad)
+        x1 = min(w, col_run[1] + pad)
+        bw = max(1, x1 - x0)
+        bh = max(1, y1 - y0)
+        body_area = int(np.count_nonzero(body[y0:y1, x0:x1]))
+        return x + x0, y + y0, bw, bh, body_area
+
+    def _sample_hex_colors(self, frame, mask, contour, bbox=None):
         contour_mask = np.zeros(mask.shape, np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, cv2.FILLED)
+        if bbox is not None:
+            x, y, w, h = bbox
+            bbox_mask = np.zeros(mask.shape, np.uint8)
+            bbox_mask[y:y + h, x:x + w] = 255
+            contour_mask = cv2.bitwise_and(contour_mask, bbox_mask)
         pixels = frame[(mask > 0) & (contour_mask > 0)]
         if len(pixels) == 0:
             return []
@@ -339,9 +417,14 @@ class BrickDetector:
             colors.append({"hex": rgb_to_hex(center), "count": int(counts[index])})
         return colors
 
-    def _find_notches(self, mask, contour):
-        x, y, w, h = cv2.boundingRect(contour)
+    def _find_notches(self, mask, contour, bbox=None):
+        if bbox is None:
+            x, y, w, h = cv2.boundingRect(contour)
+        else:
+            x, y, w, h = bbox
         roi_green = mask[y:y + h, x:x + w]
+        if roi_green.size == 0:
+            return []
         silhouette = np.zeros_like(roi_green)
         cv2.drawContours(silhouette, [contour - np.array([x, y])], -1, 255, cv2.FILLED)
         silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE, np.ones((35, 35), np.uint8), iterations=1)
@@ -430,7 +513,7 @@ class BrickDetector:
                 best = contour
         return best
 
-    def _estimate_spatial(self, mask, contour, depth, intrinsics):
+    def _estimate_spatial(self, mask, contour, depth, intrinsics, bbox=None):
         if intrinsics is None:
             return {
                 "valid": False,
@@ -438,7 +521,10 @@ class BrickDetector:
                 "axis_convention": "x right, y down, dist forward from RGB optical center",
             }
 
-        x, y, w, h = cv2.boundingRect(contour)
+        if bbox is None:
+            x, y, w, h = cv2.boundingRect(contour)
+        else:
+            x, y, w, h = bbox
         center_u = x + w / 2.0
         center_v = y + h / 2.0
         fx = float(intrinsics[0][0])
@@ -484,9 +570,15 @@ class BrickDetector:
         contour_mask = np.zeros(mask.shape, np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, cv2.FILLED)
         spatial_mask = cv2.bitwise_and(mask, contour_mask)
+        if bbox is not None:
+            bbox_mask = np.zeros(mask.shape, np.uint8)
+            bbox_mask[y:y + h, x:x + w] = 255
+            spatial_mask = cv2.bitwise_and(spatial_mask, bbox_mask)
         spatial_mask = cv2.erode(spatial_mask, np.ones((5, 5), np.uint8), iterations=1)
         if cv2.countNonZero(spatial_mask) < 50:
             spatial_mask = cv2.bitwise_and(mask, contour_mask)
+            if bbox is not None:
+                spatial_mask = cv2.bitwise_and(spatial_mask, bbox_mask)
 
         depth_values = depth[spatial_mask > 0]
         depth_values = depth_values[
@@ -591,19 +683,20 @@ class BrickDetector:
                 "notches": [],
             }
 
-        area = cv2.contourArea(contour)
-        x, y, w, h = cv2.boundingRect(contour)
+        x, y, w, h, body_area = self._solid_body_bbox(mask, contour, hsv)
+        area = float(body_area)
         extent = area / max(1, w * h)
         aspect = w / max(1, h)
-        notches = self._find_notches(mask, contour)
+        body_bbox = (x, y, w, h)
+        notches = self._find_notches(mask, contour, body_bbox)
         triangle_found = any(notch["type"] == "triangle-notch" for notch in notches)
         square_found = any(notch["type"] == "square-notch" for notch in notches)
         brick_shape = 0.45 <= extent <= 0.9 and 0.55 <= aspect <= 1.55 and w >= 80 and h >= 80
-        spatial = self._estimate_spatial(mask, contour, depth, intrinsics)
+        spatial = self._estimate_spatial(mask, contour, depth, intrinsics, body_bbox)
 
         now = time.monotonic()
         if now - self.last_hex_sample_t >= HEX_SAMPLE_PERIOD_S or not self.hex_colors:
-            self.hex_colors = self._sample_hex_colors(frame, mask, contour)
+            self.hex_colors = self._sample_hex_colors(frame, mask, contour, body_bbox)
             self.last_hex_sample_t = now
 
         color_score = min(1.0, area / 22000.0)
@@ -617,7 +710,6 @@ class BrickDetector:
             + 0.20 * square_score
         )))
 
-        cv2.drawContours(overlay, [contour], -1, (45, 230, 120), 2)
         cv2.rectangle(overlay, (x, y), (x + w, y + h), (45, 230, 120), 2)
         draw_label(overlay, f"brick {confidence}%", x, max(24, y - 8), (45, 230, 120))
         if intrinsics is not None:
@@ -634,6 +726,8 @@ class BrickDetector:
             draw_label(overlay, "depth: waiting", x, y + h + 24, (0, 255, 255))
 
         for notch in notches:
+            if notch["type"] == "negative-space":
+                continue
             bbox = notch["bbox"]
             if notch["type"] == "triangle-notch":
                 color = (0, 220, 255)
