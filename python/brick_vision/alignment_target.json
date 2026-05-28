@@ -1,0 +1,46 @@
+{
+  "captured_at": "2026-05-28T19:15:07Z",
+  "frozen": true,
+  "duration_s": 5.0,
+  "min_confidence": 55,
+  "dist_outlier_mm": 45,
+  "samples": 45,
+  "source_counts": {
+    "size": 45
+  },
+  "dominant_source": "size",
+  "kept_samples": 45,
+  "discarded_samples": 0,
+  "misses": 0,
+  "median_dist_before_filter": 249,
+  "target_mm": {
+    "x": 22,
+    "y": -21,
+    "dist": 249
+  },
+  "averages": {
+    "x": 21.87,
+    "y": -21.09,
+    "dist": 249.47,
+    "confidence": 80.0
+  },
+  "medians": {
+    "x": 22.0,
+    "y": -21.0,
+    "dist": 249.0,
+    "confidence": 80.0
+  },
+  "ranges": {
+    "x": [21, 22],
+    "y": [-22, -21],
+    "dist": [249, 250],
+    "confidence": [80, 80]
+  },
+  "stdev": {
+    "x": 0.34,
+    "y": 0.28,
+    "dist": 0.5,
+    "confidence": 0.0
+  },
+  "dist_sources": ["size"]
+}

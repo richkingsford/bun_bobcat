@@ -5,6 +5,7 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import statistics
 import sys
 import time
 from urllib.error import URLError
@@ -26,12 +27,12 @@ from host_controller import (  # noqa: E402
 
 
 DEFAULT_STATUS_URL = "http://127.0.0.1:8080/status"
-DEFAULT_TARGET_X_MM = 0
-DEFAULT_TARGET_Y_MM = 0
-DEFAULT_TARGET_DIST_MM = 30
-DEFAULT_X_DEADBAND_MM = 15
-DEFAULT_Y_DEADBAND_MM = 15
-DEFAULT_DIST_DEADBAND_MM = 15
+DEFAULT_TARGET_X_MM = 22
+DEFAULT_TARGET_Y_MM = -21
+DEFAULT_TARGET_DIST_MM = 249
+DEFAULT_X_DEADBAND_MM = 10
+DEFAULT_Y_DEADBAND_MM = 10
+DEFAULT_DIST_DEADBAND_MM = 10
 DEFAULT_MIN_CONFIDENCE = 55
 DEFAULT_POWER = 70
 DEFAULT_MAST_POWER = 70
@@ -43,11 +44,17 @@ DEFAULT_PULSE_MS_PER_MM = 1.1
 DEFAULT_MAST_MS_PER_MM = 1.4
 DEFAULT_DIST_MS_PER_MM = 1.2
 DEFAULT_SAMPLE_PAUSE_S = 0.08
-DEFAULT_MAX_SECONDS = 5.0
+DEFAULT_MAX_SECONDS = 20.0
 DEFAULT_PREFLIGHT_SECONDS = 2.0
 DEFAULT_SETTLED_SAMPLES = 3
 DEFAULT_NO_PROGRESS_SAMPLES = 6
 DEFAULT_PROGRESS_EPSILON_MM = 8
+DEFAULT_AVERAGE_SAMPLES = 5
+DEFAULT_AVERAGE_INTERVAL_S = 0.05
+DEFAULT_AVERAGE_TIMEOUT_S = 0.75
+DEFAULT_DIST_OUTLIER_MM = 45
+DEFAULT_MAX_ATTEMPTS = 40
+DEFAULT_APPROACH_X_DEADBAND_MM = None
 
 
 @dataclass
@@ -150,6 +157,47 @@ def wait_for_confident_brick(vision, seconds, pause_s):
     return None
 
 
+def average_reading(vision, args):
+    readings = []
+    deadline = time.monotonic() + args.average_timeout
+
+    while len(readings) < args.average_samples and time.monotonic() < deadline:
+        reading = vision.read()
+        if reading is not None:
+            readings.append(reading)
+        if len(readings) < args.average_samples:
+            time.sleep(args.average_interval)
+
+    if not readings:
+        return None
+
+    source_counts = {}
+    for reading in readings:
+        source_counts[reading.dist_source] = source_counts.get(reading.dist_source, 0) + 1
+    dominant_source = max(source_counts, key=source_counts.get)
+    source_readings = [
+        reading for reading in readings
+        if reading.dist_source == dominant_source
+    ]
+
+    median_dist = statistics.median(reading.dist_mm for reading in source_readings)
+    kept = [
+        reading for reading in source_readings
+        if abs(reading.dist_mm - median_dist) <= args.dist_outlier_mm
+    ]
+    if not kept:
+        kept = [min(source_readings, key=lambda reading: abs(reading.dist_mm - median_dist))]
+
+    sources = sorted({reading.dist_source for reading in kept})
+    return BrickReading(
+        x_mm=int(round(statistics.fmean(reading.x_mm for reading in kept))),
+        y_mm=int(round(statistics.fmean(reading.y_mm for reading in kept))),
+        dist_mm=int(round(statistics.fmean(reading.dist_mm for reading in kept))),
+        confidence=int(round(statistics.fmean(reading.confidence for reading in kept))),
+        dist_source="avg:" + ",".join(sources),
+    )
+
+
 def align(args):
     vision = BrickVisionClient(
         args.vision_url,
@@ -180,11 +228,12 @@ def align(args):
     last_action = None
     last_error_mm = None
     no_progress_samples = 0
+    attempts = 0
 
     try:
-        while time.monotonic() - start_t < args.max_seconds:
+        while time.monotonic() - start_t < args.max_seconds and attempts < args.max_attempts:
             try:
-                reading = vision.read()
+                reading = average_reading(vision, args)
             except RuntimeError as exc:
                 print(f"[align] {exc}")
                 link.coast()
@@ -203,6 +252,12 @@ def align(args):
             y_error = args.target_y_mm - reading.y_mm
             dist_error = reading.dist_mm - args.target_dist_mm
             x_ok = abs(x_error) <= args.x_deadband_mm
+            approach_x_deadband = (
+                args.approach_x_deadband_mm
+                if args.approach_x_deadband_mm is not None
+                else args.x_deadband_mm
+            )
+            approach_x_ok = abs(x_error) <= approach_x_deadband
             y_ok = abs(y_error) <= args.y_deadband_mm
             dist_ok = abs(dist_error) <= args.dist_deadband_mm
 
@@ -228,7 +283,25 @@ def align(args):
             pulse_gain = args.pulse_ms_per_mm
             error_mm = 0
 
-            if not x_ok:
+            if dist_error < -args.dist_deadband_mm:
+                command_sign = -args.forward_command_sign
+                if args.reverse_drive:
+                    command_sign *= -1
+                left = command_sign * args.power
+                right = command_sign * args.power
+                action = "backward"
+                error_mm = abs(dist_error)
+                pulse_gain = args.dist_ms_per_mm
+            elif not dist_ok and approach_x_ok:
+                command_sign = args.forward_command_sign
+                if args.reverse_drive:
+                    command_sign *= -1
+                left = command_sign * args.power
+                right = command_sign * args.power
+                action = "forward"
+                error_mm = abs(dist_error)
+                pulse_gain = args.dist_ms_per_mm
+            elif not x_ok:
                 turn_right = x_error > 0
                 if args.reverse_turn:
                     turn_right = not turn_right
@@ -237,16 +310,6 @@ def align(args):
                 action = "turn right" if turn_right else "turn left"
                 error_mm = abs(x_error)
                 pulse_gain = args.pulse_ms_per_mm
-            elif not dist_ok:
-                needs_forward = dist_error > 0
-                command_sign = args.forward_command_sign if needs_forward else -args.forward_command_sign
-                if args.reverse_drive:
-                    command_sign *= -1
-                left = command_sign * args.power
-                right = command_sign * args.power
-                action = "forward" if needs_forward else "backward"
-                error_mm = abs(dist_error)
-                pulse_gain = args.dist_ms_per_mm
             else:
                 needs_mast_up = y_error > 0
                 command_sign = args.mast_up_command_sign if needs_mast_up else -args.mast_up_command_sign
@@ -269,6 +332,8 @@ def align(args):
                 f"L={left:+d} R={right:+d} M={mast:+d} for {pulse_ms}ms"
             )
 
+            attempts += 1
+            print(f"[align] attempt {attempts}/{args.max_attempts}")
             if action == last_action and last_error_mm is not None:
                 progress = last_error_mm - error_mm
                 if progress < args.progress_epsilon_mm:
@@ -289,6 +354,10 @@ def align(args):
 
             send_for(link, left, right, mast, pulse_ms / 1000.0)
             time.sleep(args.sample_pause)
+
+        if attempts >= args.max_attempts:
+            print("[align] max attempts before target lock")
+            return 2
 
         print("[align] timeout before target lock")
         return 2
@@ -358,6 +427,18 @@ def main():
                         help="alignment test timeout")
     parser.add_argument("--preflight-seconds", type=float, default=DEFAULT_PREFLIGHT_SECONDS,
                         help="seconds to wait for a confident brick reading before motors are opened")
+    parser.add_argument("--average-samples", type=int, default=DEFAULT_AVERAGE_SAMPLES,
+                        help="valid vision samples to average for each motion decision")
+    parser.add_argument("--average-interval", type=float, default=DEFAULT_AVERAGE_INTERVAL_S,
+                        help="seconds between averaged vision samples")
+    parser.add_argument("--average-timeout", type=float, default=DEFAULT_AVERAGE_TIMEOUT_S,
+                        help="maximum seconds spent collecting averaged vision samples")
+    parser.add_argument("--dist-outlier-mm", type=int, default=DEFAULT_DIST_OUTLIER_MM,
+                        help="discard averaged samples this far from the median dist")
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+                        help="maximum motion attempts before this trial gives up")
+    parser.add_argument("--approach-x-deadband-mm", type=int, default=DEFAULT_APPROACH_X_DEADBAND_MM,
+                        help="temporary x tolerance for distance approach; win still uses --x-deadband-mm")
     parser.add_argument("--allow-blind-start", action="store_true",
                         help="open the motor transport even if vision is not ready")
     parser.add_argument("--reverse-turn", action="store_true",
@@ -384,6 +465,12 @@ def main():
         parser.error("--sample-pause must be non-negative and --max-seconds positive")
     if args.preflight_seconds < 0:
         parser.error("--preflight-seconds must be non-negative")
+    if args.average_samples <= 0 or args.average_interval < 0 or args.average_timeout <= 0:
+        parser.error("average sample settings must be positive")
+    if args.dist_outlier_mm < 0 or args.max_attempts <= 0:
+        parser.error("--dist-outlier-mm must be non-negative and --max-attempts positive")
+    if args.approach_x_deadband_mm is not None and args.approach_x_deadband_mm < args.x_deadband_mm:
+        parser.error("--approach-x-deadband-mm must be at least --x-deadband-mm")
     args.require_vision = not args.allow_blind_start
 
     return align(args)

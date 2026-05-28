@@ -1,0 +1,11 @@
+{
+  "captured_at": "2026-05-28T20:31:00Z",
+  "frozen": true,
+  "gate_mm": 10,
+  "source": "fresh_read_after_mast_adjustment",
+  "target_mm": {
+    "x": 0,
+    "y": -60,
+    "dist": 261
+  }
+}

@@ -1,0 +1,11 @@
+{"attempt_seconds": 7.0, "attempts": 50, "event": "game_start", "gate_mm": 10, "target": {"dist": 261, "x": 0, "y": -60}, "ts": "2026-05-28T20:27:02Z"}
+{"attempt": 1, "event": "attempt_start", "ts": "2026-05-28T20:27:03Z", "wins": 0}
+{"attempt": 1, "error": {"dist": 157, "x": -20, "y": -35}, "event": "sample", "reading": {"confidence": 40, "dist": 418, "source": "avg:stereo", "x": -20, "y": -95}, "step": 0, "ts": "2026-05-28T20:27:03Z"}
+{"action": "approach_straight", "attempt": 1, "command": {"left": -100, "mast": 0, "right": -100, "seconds": 0.157}, "error": {"dist": 157, "x": -20, "y": -35}, "event": "action", "reading": {"confidence": 40, "dist": 418, "source": "avg:stereo", "x": -20, "y": -95}, "step": 0, "ts": "2026-05-28T20:27:03Z"}
+{"attempt": 1, "error": {"dist": 157, "x": -20, "y": -35}, "event": "sample", "reading": {"confidence": 40, "dist": 418, "source": "avg:stereo", "x": -20, "y": -95}, "step": 1, "ts": "2026-05-28T20:27:04Z"}
+{"action": "approach_straight", "attempt": 1, "command": {"left": -100, "mast": 0, "right": -100, "seconds": 0.157}, "error": {"dist": 157, "x": -20, "y": -35}, "event": "action", "reading": {"confidence": 40, "dist": 418, "source": "avg:stereo", "x": -20, "y": -95}, "step": 1, "ts": "2026-05-28T20:27:04Z"}
+{"attempt": 1, "error": {"dist": 164, "x": -7, "y": -39}, "event": "sample", "reading": {"confidence": 40, "dist": 425, "source": "avg:stereo", "x": -7, "y": -99}, "step": 2, "ts": "2026-05-28T20:27:05Z"}
+{"action": "approach_straight", "attempt": 1, "command": {"left": -100, "mast": 0, "right": -100, "seconds": 0.164}, "error": {"dist": 164, "x": -7, "y": -39}, "event": "action", "reading": {"confidence": 40, "dist": 425, "source": "avg:stereo", "x": -7, "y": -99}, "step": 2, "ts": "2026-05-28T20:27:05Z"}
+{"attempt": 1, "error": {"dist": 146, "x": 58, "y": -35}, "event": "sample", "reading": {"confidence": 41, "dist": 407, "source": "avg:stereo", "x": 58, "y": -95}, "step": 3, "ts": "2026-05-28T20:27:06Z"}
+{"action": "lane_x_down", "attempt": 1, "command": {"left": 100, "mast": 0, "right": -100, "seconds": 0.114}, "error": {"dist": 146, "x": 58, "y": -35}, "event": "action", "reading": {"confidence": 41, "dist": 407, "source": "avg:stereo", "x": 58, "y": -95}, "step": 3, "ts": "2026-05-28T20:27:06Z"}
+{"attempt": 1, "event": "lost_vision", "step": 4, "ts": "2026-05-28T20:27:07Z"}
