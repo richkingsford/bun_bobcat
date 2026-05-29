@@ -2,19 +2,16 @@
 host_controller.py — Bun host-side PD controller (live brick-vision integration).
 
 Closes a 20 Hz PD loop around live OAK-D Lite millimeter telemetry served by
-python/brick_vision/stream.py at http://127.0.0.1:8080/status, and streams the
-resulting wheel commands as ASCII frames
-
-    <L,R,M>\n
-
-over USB serial at 115200 baud to the Uno Q (matches sketch/sketch.ino).
+python/brick_vision/stream.py at http://127.0.0.1:8080/status, and sends the
+resulting wheel commands to the Uno Q through Arduino RouterBridge RPC by
+default.
 L and R are signed integers in [-100, 100]; sign maps to direction on the
-sketch, magnitude maps to PWM duty. M is the mast servo command and is kept
-at 0 by this controller.
+sketch, magnitude maps to PWM duty. The mast servo command is kept at 0 by
+this controller.
 
 If the brick is lost — no detection, confidence below threshold, invalid
 spatial fix, or the HTTP poll fails — the controller transmits a coast
-frame (<0,0>) and clears the PD's derivative memory so the next valid
+command and clears the PD's derivative memory so the next valid
 reading doesn't fire a phantom d/dt spike on reacquisition. The sketch's
 500 ms watchdog is a second line of defence; this is the first.
 
@@ -271,8 +268,8 @@ class SerialLink:
 
 
 class RpcLink:
-    """App Lab RouterBridge transport. Streams signed drive_triple values to
-    the known-good Bun sketch."""
+    """Arduino RouterBridge transport. This is the default on Uno Q because
+    arduino-router owns the internal serial device."""
     def __init__(self, socket_path=DEFAULT_ROUTER_SOCKET):
         self.socket_path = socket_path
         self.bridge = None

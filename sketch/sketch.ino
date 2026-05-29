@@ -9,6 +9,8 @@
 //   Left tread:  pins 6 / 7
 //   Right tread: pins 8 / 9
 //   Bridge.call("drive", motorCode, dirCode, power, durationMs)
+//   Bridge.call("drive_pair", leftPct, rightPct)
+//   Bridge.call("drive_triple", leftPct, rightPct, mastPct)
 //
 // Mast solution is intentionally carried over from
 // "995 servo moving both ways.txt":
@@ -59,6 +61,7 @@ void setup() {
   Bridge.provide_safe("drive", drive);
   Bridge.provide_safe("mast", driveMast);
   Bridge.provide_safe("drive_mast", driveMast);
+  Bridge.provide_safe("drive_pair", drivePair);
   Bridge.provide_safe("drive_triple", driveTriple);
 
   Monitor.println("Bun Bridge tread + mast control ready.");
@@ -124,6 +127,10 @@ void driveTriple(int leftPct, int rightPct, int mastPct) {
   setSignedMotor(leftMotor, leftPct);
   setSignedMotor(rightMotor, rightPct);
   driveMast(mastPct);
+}
+
+void drivePair(int leftPct, int rightPct) {
+  driveTriple(leftPct, rightPct, 0);
 }
 
 void setSignedMotor(Motor &m, int signedPower) {
