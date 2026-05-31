@@ -57,7 +57,7 @@ CTRL_HZ = 20
 # Transports
 DEFAULT_ROUTER_SOCKET = "/var/run/arduino-router.sock"
 RPC_TIMEOUT_S         = 2.0
-DEFAULT_PORT          = "/dev/ttyACM0"
+DEFAULT_PORT          = "/dev/ttyHS1"   # Uno Q hardware UART (serial path only)
 SERIAL_BAUD           = 115200
 SERIAL_TIMEOUT_S      = 0.05
 RECONNECT_WAIT_S      = 1.0
@@ -71,6 +71,29 @@ VISION_MIN_CONFIDENCE = 55      # matches align_to_brick.py default
 
 # Telemetry print rate
 PRINT_EVERY_N_TICKS = 5         # 20 Hz / 5 = 4 Hz log
+
+
+# ---------------------------------------------------------------------------
+# Motor wiring calibration (host-side; no firmware change required)
+#
+# Live testing on Bun, corroborated by the May 28 step-1 alignment trials
+# (motion_calibration.json: the "dist_toward" act made dist_mm INCREASE and
+# "dist_away" made it DECREASE), shows the drive is inverted: a forward
+# command drives the robot backward, and heading correction runs away into
+# a ~90 deg spin. Reversed polarity on BOTH channels flips the sense of
+# omega too, which is what turns the heading loop into positive feedback.
+#
+# These toggles rewrite the final l_pct / r_pct just before they are handed
+# to the transport (RouterBridge drive_triple or serial), so the correction
+# lives entirely on the host - no reflash. Set them per physical unit:
+#   INVERT_LEFT_MOTOR / INVERT_RIGHT_MOTOR  negate that channel (reversed leads)
+#   SWAP_LEFT_RIGHT_MOTORS                  exchange channels (sides swapped)
+# For Bun's observed symptom set BOTH inversion flags to True (leave swap
+# False). Defaults are False so a fresh checkout assumes correct wiring.
+# ---------------------------------------------------------------------------
+INVERT_LEFT_MOTOR      = False
+INVERT_RIGHT_MOTOR     = False
+SWAP_LEFT_RIGHT_MOTORS = False
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +428,17 @@ def main():
                 x_off, y_off, dist = reading
                 l_pct, r_pct = pd.step(x_off, y_off, dist, dt)
                 state = "tracking"
+
+            # Hardware-wiring correction on the final outputs (see toggles
+            # up top). Swap-then-invert so INVERT_* always name the physical
+            # channel after any swap. No-op on the (0,0) coast, and the
+            # printed L/R below therefore reflect what goes on the wire.
+            if SWAP_LEFT_RIGHT_MOTORS:
+                l_pct, r_pct = r_pct, l_pct
+            if INVERT_LEFT_MOTOR:
+                l_pct = -l_pct
+            if INVERT_RIGHT_MOTOR:
+                r_pct = -r_pct
 
             if transport != "dry-run":
                 try:
