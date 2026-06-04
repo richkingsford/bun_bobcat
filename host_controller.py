@@ -91,9 +91,9 @@ PRINT_EVERY_N_TICKS = 5         # 20 Hz / 5 = 4 Hz log
 # For Bun's observed symptom set BOTH inversion flags to True (leave swap
 # False). Defaults are False so a fresh checkout assumes correct wiring.
 # ---------------------------------------------------------------------------
-INVERT_LEFT_MOTOR      = False
-INVERT_RIGHT_MOTOR     = False
-SWAP_LEFT_RIGHT_MOTORS = False
+INVERT_LEFT_MOTOR      = True
+INVERT_RIGHT_MOTOR     = True
+SWAP_LEFT_RIGHT_MOTORS = True
 
 
 # ---------------------------------------------------------------------------

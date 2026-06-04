@@ -25,6 +25,12 @@ GREEN_UPPER_HSV = np.array([95, 255, 255])
 BODY_MIN_S = 145
 BODY_MIN_V = 105
 MIN_BRICK_AREA = 4000
+BRICK_JOIN_KERNEL = np.ones((23, 31), np.uint8)
+BODY_BOUNDS_KERNEL = np.ones((19, 19), np.uint8)
+MIN_FULL_TARGET_W = 78
+MIN_FULL_TARGET_H = 68
+MIN_FULL_TARGET_AREA = 6500
+MAX_SOLID_SHRINK_FRAC = 0.72
 HEX_SAMPLE_COUNT = 12
 HEX_SAMPLE_PERIOD_S = 2.0
 MAX_HEX_PIXELS = 6000
@@ -361,8 +367,9 @@ class BrickDetector:
             if cv2.countNonZero(core) < 50:
                 core = body
 
-        row_counts = np.count_nonzero(core, axis=1)
-        col_counts = np.count_nonzero(core, axis=0)
+        bounds_core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, BODY_BOUNDS_KERNEL, iterations=1)
+        row_counts = np.count_nonzero(bounds_core, axis=1)
+        col_counts = np.count_nonzero(bounds_core, axis=0)
         if row_counts.size == 0 or col_counts.size == 0 or row_counts.max() == 0 or col_counts.max() == 0:
             return x, y, w, h, int(cv2.contourArea(contour))
 
@@ -385,6 +392,26 @@ class BrickDetector:
         bh = max(1, y1 - y0)
         body_area = int(np.count_nonzero(body[y0:y1, x0:x1]))
         return x + x0, y + y0, bw, bh, body_area
+
+    def _contour_green_area(self, mask, contour, bbox):
+        x, y, w, h = bbox
+        contour_mask = np.zeros(mask.shape, np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, cv2.FILLED)
+        bbox_mask = np.zeros(mask.shape, np.uint8)
+        bbox_mask[y:y + h, x:x + w] = 255
+        target_mask = cv2.bitwise_and(mask, cv2.bitwise_and(contour_mask, bbox_mask))
+        return int(cv2.countNonZero(target_mask))
+
+    def _full_target_lock_quality(self, bbox):
+        _x, _y, w, h = bbox
+        area = w * h
+        if w < MIN_FULL_TARGET_W:
+            return False, f"bbox width {w}px below full-target gate {MIN_FULL_TARGET_W}px"
+        if h < MIN_FULL_TARGET_H:
+            return False, f"bbox height {h}px below full-target gate {MIN_FULL_TARGET_H}px"
+        if area < MIN_FULL_TARGET_AREA:
+            return False, f"bbox area {area}px below full-target gate {MIN_FULL_TARGET_AREA}px"
+        return True, "full target lock"
 
     def _sample_hex_colors(self, frame, mask, contour, bbox=None):
         contour_mask = np.zeros(mask.shape, np.uint8)
@@ -649,8 +676,9 @@ class BrickDetector:
         mask = cv2.inRange(hsv, GREEN_LOWER_HSV, GREEN_UPPER_HSV)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+        joined_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, BRICK_JOIN_KERNEL, iterations=1)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(joined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = [contour for contour in contours if cv2.contourArea(contour) >= MIN_BRICK_AREA]
         if not contours:
             draw_label(overlay, "brick: searching", 16, 32, (180, 190, 200))
@@ -683,11 +711,66 @@ class BrickDetector:
                 "notches": [],
             }
 
-        x, y, w, h, body_area = self._solid_body_bbox(mask, contour, hsv)
+        contour_bbox = cv2.boundingRect(contour)
+        solid_x, solid_y, solid_w, solid_h, solid_area = self._solid_body_bbox(mask, contour, hsv)
+        contour_x, contour_y, contour_w, contour_h = contour_bbox
+        solid_shrank_to_fragment = (
+            solid_w < MIN_FULL_TARGET_W
+            or solid_h < MIN_FULL_TARGET_H
+            or solid_w < contour_w * MAX_SOLID_SHRINK_FRAC
+            or solid_h < contour_h * MAX_SOLID_SHRINK_FRAC
+        )
+        contour_is_full_target, contour_reason = self._full_target_lock_quality(contour_bbox)
+
+        if solid_shrank_to_fragment and contour_is_full_target:
+            x, y, w, h = contour_bbox
+            body_area = self._contour_green_area(mask, contour, contour_bbox)
+            bbox_source = "joined-contour"
+            bbox_note = "solid bbox collapsed; using joined full-target contour"
+        else:
+            x, y, w, h = solid_x, solid_y, solid_w, solid_h
+            body_area = solid_area
+            bbox_source = "solid-body"
+            bbox_note = "solid body bbox"
+
+        body_bbox = (x, y, w, h)
+        full_target_lock, lock_reason = self._full_target_lock_quality(body_bbox)
+        if not full_target_lock:
+            reject_reason = lock_reason
+            draw_label(overlay, f"brick rejected: {reject_reason}", 16, 32, (70, 190, 255))
+            cv2.rectangle(
+                overlay,
+                (contour_x, contour_y),
+                (contour_x + contour_w, contour_y + contour_h),
+                (70, 190, 255),
+                2,
+            )
+            return overlay, {
+                "found": False,
+                "confidence": 0,
+                "reason": reject_reason,
+                "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+                "hex_colors": self.hex_colors,
+                "signals": {
+                    "green_area": round(float(body_area), 1),
+                    "brick_shape": False,
+                    "triangle_notch": False,
+                    "square_notch": False,
+                    "full_target_lock": False,
+                },
+                "quality": {
+                    "bbox_source": bbox_source,
+                    "bbox_note": bbox_note,
+                    "reject_reason": reject_reason,
+                    "contour_bbox": {"x": int(contour_x), "y": int(contour_y), "w": int(contour_w), "h": int(contour_h)},
+                    "solid_bbox": {"x": int(solid_x), "y": int(solid_y), "w": int(solid_w), "h": int(solid_h)},
+                },
+                "notches": [],
+            }
+
         area = float(body_area)
         extent = area / max(1, w * h)
         aspect = w / max(1, h)
-        body_bbox = (x, y, w, h)
         notches = self._find_notches(mask, contour, body_bbox)
         triangle_found = any(notch["type"] == "triangle-notch" for notch in notches)
         square_found = any(notch["type"] == "square-notch" for notch in notches)
@@ -701,13 +784,15 @@ class BrickDetector:
 
         color_score = min(1.0, area / 22000.0)
         shape_score = 1.0 if brick_shape else 0.35
+        full_target_score = 1.0 if full_target_lock else 0.0
         triangle_score = 1.0 if triangle_found else 0.0
         square_score = 1.0 if square_found else 0.0
         confidence = int(round(100.0 * (
-            0.34 * color_score
-            + 0.22 * shape_score
-            + 0.24 * triangle_score
-            + 0.20 * square_score
+            0.24 * color_score
+            + 0.24 * shape_score
+            + 0.26 * full_target_score
+            + 0.16 * triangle_score
+            + 0.10 * square_score
         )))
 
         cv2.rectangle(overlay, (x, y), (x + w, y + h), (45, 230, 120), 2)
@@ -761,6 +846,14 @@ class BrickDetector:
                 "brick_shape": bool(brick_shape),
                 "triangle_notch": bool(triangle_found),
                 "square_notch": bool(square_found),
+                "full_target_lock": True,
+            },
+            "quality": {
+                "bbox_source": bbox_source,
+                "bbox_note": bbox_note,
+                "reject_reason": "",
+                "contour_bbox": {"x": int(contour_x), "y": int(contour_y), "w": int(contour_w), "h": int(contour_h)},
+                "solid_bbox": {"x": int(solid_x), "y": int(solid_y), "w": int(solid_w), "h": int(solid_h)},
             },
             "spatial": spatial,
             "notches": notches,
