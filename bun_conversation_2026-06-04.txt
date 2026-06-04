@@ -1,0 +1,799 @@
+Bun calibration conversation - 2026-06-04
+Workspace: C:\Users\rking\OneDrive\Documents\Bun
+Remote robot: UnoQ / q1.local / arduino@192.168.1.44
+Branch: feat/live-vision-integration
+
+Note:
+This is a transcript-style working record reconstructed from the chat context
+available to Codex. It is intended to preserve the useful engineering history:
+requests, decisions, code changes, commands, observations, wins, failures, and
+the final state. It is not a byte-for-byte export of every tool line.
+
+
+1. Connection and branch setup
+
+User asked whether Codex could remote into:
+
+  Host UnoQ
+      HostName q1.local
+      User arduino
+      Port 22
+
+User then verified:
+
+  ssh UnoQ "hostname; whoami"
+
+Result:
+
+  q1
+  arduino
+
+User asked to update to the latest of branch:
+
+  feat/live-vision-integration
+
+
+2. Stage 1 request from Siori
+
+User asked Codex to do Stage 1 from an email:
+
+  cd ~/bun_bobcat
+  git pull --ff-only
+  sed -i 's/^INVERT_LEFT_MOTOR      = False/INVERT_LEFT_MOTOR      = True/'  host_controller.py
+  sed -i 's/^INVERT_RIGHT_MOTOR     = False/INVERT_RIGHT_MOTOR     = True/'  host_controller.py
+
+Then:
+
+  Launch stream.py in one terminal.
+  Run python3 host_controller.py in the other.
+  Let it run once.
+  If it glides forward directly to the 100mm setpoint, tracks are calibrated.
+  If it drives forward but steers away, set SWAP_LEFT_RIGHT_MOTORS to True.
+
+Observation:
+The bot, Bun, pivoted hard left and lost brick vision.
+
+User emphasized that the goal was to align with the brick:
+
+  x = 0
+  y = 0
+  dist = 100mm was originally fine.
+
+Repeated observed behavior:
+
+  Bun turned left until the brick was out of sight.
+
+
+3. Calibration expectations
+
+User asked for calibration good enough to answer:
+
+  To close an x=11mm gap, I must send this command: _____
+  To close a dist=11mm gap, I must send this command: _____
+  To close an x=11mm plus a dist=50mm gap in a single movement, I must send this command: _____
+  To close a y=10mm gap, I must send this command: _____
+
+User repeated Siori's instructions and clarified:
+
+  "I'm asking you to do that for me."
+
+User requested proof of controlled movement on all three axes:
+
+  - Deliberately travel 1-7mm across all 3 axes.
+  - Show gentle forward-right, forward-left, backward-right, backward-left.
+  - Show the same four strong turns, but both wheels must move.
+  - Max should be 0.5s in later testing.
+  - Keep the brick in sight.
+  - Recover gracefully if vision is lost.
+
+User repeatedly asked to rerun movements while watching.
+
+Important user correction:
+
+  A slight left turn using only a single motor was not acceptable.
+  User wanted forward, backward, gentle left, gentle right, strong left,
+  strong right, up/down, and both directions across all relevant axes.
+
+
+4. Evidence website request
+
+User asked for a controlledMovements.py script that:
+
+  - Illustrates deliberate movements.
+  - Outputs evidence in the form of a basic website hosted by the bot.
+  - Shows text descriptions of movements.
+  - Shows before/after camera photos.
+  - Places before on the left, movement description in the middle, after on the right.
+
+User later requested:
+
+  - Make every move 1s.
+  - Toss old runs.
+  - Go forward for 2s, then run it.
+  - Stay within a 100mm x 100mm rectangle.
+  - Demonstrate alignment with the brick or get into a 10mm x 10mm box around
+    roughly 100mm in front of the brick.
+
+Result:
+Several calibration/evidence runs were created. Progress improved, but not
+enough to claim bug-free, precise, repeatable alignment under the original
+100mm target.
+
+
+5. User asked whether the Siori instructions were followed exactly
+
+User asked:
+
+  "Did you run these instructions exactly?"
+
+User emphasized:
+
+  "No sidestepping those instructions from Siori - follow them exactly."
+
+Further issue:
+
+  "The bot keeps turning only one motor."
+
+This became a recurring failure mode: one-wheel or one-tread movement when
+two-tread movement was expected.
+
+
+6. Attached implementation details
+
+User attached or referenced:
+
+  G:/My Drive/IronPaw robotics/Chat GPT's suggestion - leia_gap_closing_trials.csv
+  G:/My Drive/IronPaw robotics/Chat GPT's suggestion - brick_vision_model_lockdown.md
+  G:/My Drive/IronPaw robotics/Chat GPT's suggestion - leia_gap_closing_spec.json
+  G:/My Drive/IronPaw robotics/Chat GPT's suggestion - leia_gap_closing_spec_demo.html
+
+User requested:
+
+  - Carefully improve the ability to align with the brick using those details.
+  - Replace weak solutions.
+  - Improve high-potential solutions.
+  - Use only small movements.
+  - Continue iterating and prove through the website that Bun moves deliberately
+    and consistently.
+  - Do 10 iterations, learning from every mistake.
+
+User also provided a preferred recovery behavior for the specific mistake:
+
+  If Bun turns left until vision is lost, recover by turning the right wheel
+  backward 3 times for 250ms each time.
+
+User explicitly said not to follow instructions blindly, but to improve graceful
+recovery in the script.
+
+
+7. Iterative alignment attempts
+
+User asked:
+
+  "Very nice! Did you improve with every mistake? Did you achieve your first win?
+   What do I mean by win?"
+
+Codex interpretation:
+
+  A "win" means reaching the Step 1 target gate:
+  x=0, y=0, dist target, within the specified tolerance.
+
+User requested:
+
+  - Keep fighting for victory.
+  - 10 more iterations.
+  - Learn from every mistake.
+  - Never introduce hacks.
+  - Never hand-hold the robot.
+  - Goal: Bun should quickly, reliably, consistently pick and place bricks.
+  - First focus: close dist and x gaps.
+  - Later: work on y gaps.
+
+User asked for single-attempt diagnosis:
+
+  "Make only 1 attempt with this next single iteration. I'd like your opinion
+   about what went wrong and how best to fix the bug with every overshot,
+   undershot, or wrong-way act."
+
+User later asked:
+
+  "Do you have a plan to fix? How will we win the next attempt? implement it
+   and go."
+
+The minimum duration was changed to 0.25s during this phase.
+
+
+8. Git clean branch request
+
+User said there was useful work but it needed to be pushed to its own separate
+branch, then reset the workspace:
+
+  git reset --hard origin/feat/live-vision-integration
+
+This was understood as a request to preserve work separately, then restore a
+clean branch state. Care was needed because destructive git commands should not
+be run casually.
+
+
+9. Standalone calibrate_tracks.py request
+
+User requested:
+
+  Act as a QA test engineer.
+  We have a pristine host_controller.py running continuous PD.
+  Write a safe, discrete calibrate_tracks.py.
+  Do not modify host_controller.py or Arduino firmware.
+  Initialize SerialLink on /dev/ttyHS1.
+  Send <20,20> for exactly 500ms.
+  Log data.
+  Then command <0,0> coast.
+  If robot moves backward or spins instead of rolling straight forward, tell
+  exactly which toggle in host_controller.py to flip:
+    INVERT_LEFT_MOTOR
+    INVERT_RIGHT_MOTOR
+    SWAP_LEFT_RIGHT_MOTORS
+
+User asked Codex to run it.
+
+Observed:
+
+  - Initially no movement.
+  - User asked to try again with max 250ms.
+  - A jitter was observed.
+  - User asked for a 2s range using 200ms increments, slowly dialing up power,
+    forwards then backwards.
+  - Observed: went back, then right tread only moved forward.
+
+After fixes, user reported:
+
+  "Very nice! that went forward and back very smoothly. can you give me the logs?"
+
+Important log artifact referenced later:
+
+  C:/Users/rking/Downloads/calibrate_tracks_20260604T173832Z.jsonl
+
+User later said this log proved phase 1 calibration victory:
+
+  Both motors had moved forward for 2s and back for 2s.
+
+
+10. Master orchestration loop request
+
+User requested a Step 1 automation loop in main.py:
+
+  1. Launch host_controller.py as a subprocess.
+  2. Let the continuous PD loop steer to the target.
+  3. Monitor telemetry.
+  4. Once target gates are satisfied, log Success.
+  5. Terminate host_controller.
+  6. Execute reset:
+       tracks backward at <-30,-30> for random 0.5 to 1.5s
+       plus slight random pivot left or right while keeping brick in view.
+  7. Relaunch host_controller.
+  8. Run automatically for 20 attempts.
+  9. Output final success percentage report.
+
+User asked Codex to start it.
+
+Observed repeated failure:
+
+  - Only the right motor turned forward.
+  - Bun turned sharply left.
+  - Same problem repeated.
+
+User asked why only the right wheel was moving when both wheels had just moved
+smoothly in calibration.
+
+User asked to fix the left wheel weak bug and get at least a single win.
+
+
+11. Motor/pin debugging
+
+User said:
+
+  "Same problem... we just proved a moment ago that we can turn both wheels.
+   We went straight forward and straight back for 2s. I'd like to see that
+   again. Then show me a table of what power was sent to which wheel."
+
+User later said:
+
+  "Only the right wheel turned. Attached is the logs for our victory on phase 1
+   - calibration. This proves we can move both motors. Repeat this."
+
+User observed:
+
+  - Only the right wheel moved forward.
+  - Both went back ok.
+  - Increasing floor and ceiling by 20 percent was requested.
+  - 100 percent speed forward and back for 1s was requested.
+  - Repeated "again" requests.
+  - User concluded the left motor seemed unable to go backwards.
+
+User asked:
+
+  Confirm we are using the right pins on Uno Q: 6,7 and 8,9.
+
+Important later note:
+
+  User saw left motor move forward by itself and asked how that happened.
+  Codex identified that raw channel/sign combinations were affecting the
+  physical tread behavior differently than semantic commands.
+
+
+12. Architecture warning
+
+User said:
+
+  "Remember to preserve our architecture. no cobbling on hacks."
+
+This became a guiding constraint:
+
+  - Do not hack host_controller.py just to make one run work.
+  - Keep production controller and QA/calibration scripts separate.
+  - Use named calibration toggles and test harnesses.
+  - Avoid manual handholding as a substitute for learned behavior.
+
+
+13. Full calibration request
+
+User asked to proceed with full calibration:
+
+  "I'd like evidence that we can purposefully/reliably/efficiently close
+   distance and x gaps both large and small."
+
+Work performed during this larger calibration phase included:
+
+  - Scripts for controlled movement and evidence generation.
+  - Slow crawl primitives.
+  - Full calibration reports under .cache/controlled_movements.
+  - Hosted website evidence on port 8090.
+  - Vision stream on port 8080.
+
+Key remote repo location:
+
+  /home/arduino/bun_bobcat
+
+Important files touched or created during the day:
+
+  host_controller.py
+  python/main.py
+  python/brick_vision/stream.py
+  python/brick_vision/align_to_brick.py
+  python/brick_vision/step1_target.json
+  python/brick_vision/alignment_target.json
+  python/brick_vision/full_motion_calibration.json
+  calibrate_tracks.py
+  crawl_tracks.py
+  full_calibration.py
+  sketch/sketch.ino
+
+
+14. Vision stack detection fix
+
+Observed problem:
+
+  The detector sometimes locked onto only a stripe or partial contour of the
+  brick stack, causing bogus distance estimates.
+
+Important fix:
+
+  python/brick_vision/stream.py was patched to merge stack contours:
+
+  - Added _merged_true_bounds(...)
+  - Added _merge_stack_contours(...)
+  - In detect, after choosing contour:
+      contour = self._merge_stack_contours(contours, contour)
+    before _solid_body_bbox.
+
+Effect:
+
+  Bbox expanded to the full stack, around 238x262 in one good case.
+  Distance corrected from a bogus roughly 328mm to about 226mm.
+
+
+15. Target changed to 200mm and tolerances widened
+
+User asked:
+
+  "Did you achieve your first win? Let's change the dist target to 200mm and
+   widen all tolerances to 25mm. get us to the win position. Reminder about no
+   hacks or messing up our architecture."
+
+Changes made:
+
+  host_controller.py:
+    STOP_OFFSET_MM = 200.0
+
+  python/main.py:
+    DEFAULT_TARGET_DIST_MM = 200.0
+    DEFAULT_GATE_MM = 25.0
+
+  python/brick_vision/align_to_brick.py:
+    DEFAULT_TARGET_DIST_MM = 200
+    DEFAULT_X_DEADBAND_MM = 25
+    DEFAULT_Y_DEADBAND_MM = 25
+    DEFAULT_DIST_DEADBAND_MM = 25
+
+  python/brick_vision/step1_target.json:
+    target x=0, y=0, dist=200
+    gate_mm=25
+
+  python/brick_vision/alignment_target.json:
+    target x=0, y=0, dist=200
+    gate_mm=25
+
+Outcome:
+
+  Original 100mm / +/-10mm win was not achieved.
+  Revised 200mm / +/-25mm win was achieved once.
+
+Verified win sample:
+
+  Target: x=0, y=0, dist=200
+  Gate: +/-25mm
+  Median over 60 samples:
+    x = -3mm
+    y = 14mm
+    dist = 220mm
+    confidence = 80
+  Error:
+    x = -3mm
+    y = +14mm
+    dist = +20mm
+  In gate: true
+
+Evidence site:
+
+  http://192.168.1.44:8090/.cache/controlled_movements/win_200mm_gate_20260604T211556Z/index.html
+
+Codex noted:
+
+  This was a first win under the revised 200mm / +/-25mm gate, not under the
+  original 100mm / +/-10mm gate.
+
+
+16. Reset-after-every-win and 20 wins request
+
+User asked:
+
+  "Can you do a reset after every win? Just back up straight for rand(1.5-2s)
+   and then turn one of the wheels randomly for .3s to get us a nice x offset.
+   Then get us 20 wins in a row!"
+
+Code change in python/main.py:
+
+  Reset behavior became:
+    semantic <-30,-30> for random 1.5 to 2.0s
+    then randomly choose one wheel for 0.30s
+
+  The loop was changed to treat the 20 attempts as a true consecutive streak:
+    stop on first failure by default
+    report successes, attempts done, success percentage, consecutive count
+
+First streak run:
+
+  Attempt 1 succeeded:
+    x=-2
+    y=16
+    dist=204
+
+  Reset ran:
+    semantic <-30,-30> for about 1.92s
+    then left wheel only <30,0> for 0.30s
+
+  Attempt 2 failed:
+    After reset, brick started around x=+31mm.
+    host_controller repeatedly drove x in the wrong direction.
+    x grew to about +199mm.
+    Vision was lost.
+
+Conclusion:
+
+  This matched Siori's condition:
+    if it drives forward but steers away, set SWAP_LEFT_RIGHT_MOTORS=True.
+
+
+17. SWAP_LEFT_RIGHT_MOTORS changed to True
+
+Change:
+
+  host_controller.py:
+    INVERT_LEFT_MOTOR = True
+    INVERT_RIGHT_MOTOR = True
+    SWAP_LEFT_RIGHT_MOTORS = True
+
+Probe after change:
+
+  Before:
+    x about +241mm
+    confidence about 28
+  After short corrected steering probe:
+    x about +213mm
+    confidence about 57
+
+Interpretation:
+
+  Steering correction moved in the right direction.
+
+Then bounded recovery pulses were used:
+
+  User-suggested recovery:
+    right wheel backward 250ms pulses
+
+  Result:
+    x moved from about +210 to +130
+    confidence improved to about 56
+
+At this point the robot briefly dropped off network.
+
+
+18. Network interruption and reconnection
+
+Network issue:
+
+  ssh to 192.168.1.44 timed out.
+  q1.local did not resolve.
+  ping failed.
+  ARP showed 192.168.1.44 unreachable.
+
+User said:
+
+  "It looks fine to me. Are you able to connect to it?"
+
+Codex retried:
+
+  q1.local resolved again:
+    A: 192.168.1.44
+    AAAA: fe80::43be:f98f:264a:ba7b
+
+  SSH succeeded:
+    q1
+    arduino
+
+Codex sent explicit coast and read status:
+
+  x=+26mm
+  y=-7mm
+  dist=402mm
+  confidence=72
+
+
+19. Arrival deadband patch
+
+Problem:
+
+  With swap true, the controller got close to the gate, but kept moving after
+  two good samples and overshot before the third confirmation.
+
+Fix idea:
+
+  Add a real arrival deadband to host_controller.py:
+    if abs(x) <= 25mm and abs(dist - 200) <= 25mm:
+      command coast
+      let supervisor confirm the full x/y/dist gate
+
+Change:
+
+  host_controller.py added:
+    ARRIVAL_X_GATE_MM = 25.0
+    ARRIVAL_DIST_GATE_MM = 25.0
+
+  The main controller loop gained an "arrived" state:
+    l_pct = 0
+    r_pct = 0
+    pd.reset()
+    state = "arrived"
+    burst reset / settle reset
+
+  python/main.py telemetry parser was updated to recognize:
+    tracking
+    lost
+    settle
+    arrived
+
+Result:
+
+  The controller began coasting when inside x/dist arrival band.
+
+
+20. Low-confidence and fragment-detection issue
+
+When attempting automation with a lower min-confidence threshold:
+
+  --min-confidence 40
+
+Observation:
+
+  The detector flickered between:
+    real full-stack detection
+    bottom-frame green strips/fragments
+
+Failure:
+
+  Vision became unstable and low-confidence.
+  The robot was too close or badly framed.
+  The detector sometimes reported absurd distances from fragments.
+
+Codex concluded lowering min-confidence was a bad automation move.
+
+
+21. Rolling-median gate and arrival latch proposal
+
+After a guarded single attempt:
+
+  Bun got two clean gate samples:
+    x=-7
+    y=14
+    dist=215
+
+  Then one noisy distance sample kicked the controller out of arrival and it
+  drove away.
+
+Planned proper fix:
+
+  1. Add arrival latch to host_controller.py:
+       once inside arrival band, stay coasting unless repeated readings are
+       outside a wider release band.
+
+  2. Add rolling-median gate to python/main.py:
+       use median of the last 3 valid readings for gate decision instead of
+       resetting success count on one noisy frame.
+
+Changes patched locally and copied to Bun:
+
+  host_controller.py:
+    ARRIVAL_RELEASE_X_MM = 40.0
+    ARRIVAL_RELEASE_DIST_MM = 45.0
+    ARRIVAL_RELEASE_SAMPLES = 3
+    arrival_latched
+    arrival_release_count
+
+  python/main.py:
+    import deque
+    import statistics
+    added median_reading(...)
+    gate_window = deque(maxlen=args.confirm_samples)
+    success gate uses median reading from the confirm window
+
+Compilation result:
+
+  compile_ok
+
+
+22. Final live state before the user paused the effort
+
+After several recovery attempts, the robot became too close to the brick stack.
+
+Snapshot showed:
+
+  The brick filled the bottom of the frame.
+  The detector was locking on to a low-confidence green strip.
+
+Example status:
+
+  confidence around 21
+  x around 80
+  y around 117
+  dist around 360
+  bbox at bottom of frame
+
+Codex sent coast.
+
+User then said:
+
+  "I'm getting nervous about all the handholding and hacks you seem to be doing.
+   I'd like to help you solve these many problems."
+
+Codex agreed and stopped motion.
+
+Final safety check:
+
+  Motors coasting.
+  No running python/main.py or host_controller.py process observed.
+  Current vision not trustworthy:
+    confidence around 21
+    bbox at bottom of frame
+    likely a partial green strip rather than the brick stack
+
+
+23. Current engineering assessment
+
+Proved:
+
+  - SSH access to Bun works when network is reachable.
+  - Both motors can move forward and backward in discrete calibration.
+  - A revised 200mm / +/-25mm win was achieved once with stable median evidence.
+  - SWAP_LEFT_RIGHT_MOTORS=True corrected at least one steering-away sign error.
+  - Full-stack vision contour merging improved distance estimation.
+  - Arrival deadband / latch and rolling-median gate are reasonable architectural
+    fixes, not one-off physical handholding.
+
+Not proved:
+
+  - Original 100mm / +/-10mm win.
+  - 20 consecutive wins.
+  - Reliable unattended recovery after reset.
+  - Robust y-gap closure.
+  - Fully stable vision lock across close, cropped, off-axis, and reset poses.
+
+Major failure modes seen:
+
+  1. Steering-away sign issue before SWAP_LEFT_RIGHT_MOTORS=True.
+  2. One-tread or weak-left behavior in some command regimes.
+  3. Detector locking onto partial green strips at frame edges.
+  4. Distance estimates jumping when brick is cropped or too close.
+  5. Controller continuing to move after entering gate before supervisor
+     confirmed success.
+  6. Manual recovery pulses started to substitute for a disciplined test plan.
+
+
+24. Recommended next plan
+
+Codex recommended pausing the 20-win goal and switching to a clean QA protocol:
+
+  1. Vision lock test:
+       Prove detector sees the full brick stack, not strips/fragments.
+
+  2. Motor semantic test:
+       Prove forward/back/left/right commands produce expected signed deltas.
+
+  3. Reset test:
+       Prove reset returns to a known, visible starting condition.
+
+  4. Single closed-loop attempt:
+       Only then try one win.
+
+  5. Repeatability:
+       Only after multiple clean single wins attempt 20 consecutive wins.
+
+Codex committed to:
+
+  - Stop "just trying stuff."
+  - Before each physical movement, state:
+      exact test
+      expected result
+      duration
+      stop condition
+  - Avoid handholding and hacks.
+  - Preserve the architecture.
+
+
+25. Important file paths and links
+
+Remote repo:
+
+  /home/arduino/bun_bobcat
+
+Local workspace:
+
+  C:\Users\rking\OneDrive\Documents\Bun
+
+Evidence site root:
+
+  http://192.168.1.44:8090/
+
+Confirmed revised win evidence:
+
+  http://192.168.1.44:8090/.cache/controlled_movements/win_200mm_gate_20260604T211556Z/index.html
+
+Important stdout/log examples:
+
+  /home/arduino/bun_bobcat/logs/step1_master/step1_master_20260604T214218Z.jsonl
+  /home/arduino/bun_bobcat/logs/step1_master/run20_20260604T214217Z.stdout.log
+  /home/arduino/bun_bobcat/logs/step1_master/run20_swaptrue_20260604T222237Z.stdout.log
+  /home/arduino/bun_bobcat/logs/step1_master/run20_arrival_min40_20260604T222625Z.stdout.log
+  /home/arduino/bun_bobcat/logs/step1_master/step1_master_20260604T222753Z.jsonl
+
+Local debug image captured:
+
+  C:\Users\rking\OneDrive\Documents\Bun\bun_current_debug.jpg
+
+
+26. Last requested action
+
+User asked:
+
+  "Can you put today's conversation in a txt file for me?"
+
+This file was created in response.
+
