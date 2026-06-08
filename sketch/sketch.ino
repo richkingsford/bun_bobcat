@@ -22,7 +22,7 @@
 const int LEFT_A   = 6;
 const int LEFT_B   = 7;
 const int RIGHT_A  = 8;
-const int RIGHT_B  = 9;
+const int RIGHT_B  = 5;
 const int MAST_PIN = 10;
 
 const int MAST_NEG     = 30;
@@ -30,7 +30,7 @@ const int MAST_NEUTRAL = 90;
 const int MAST_POS     = 150;
 
 const unsigned long PWM_PERIOD_US = 5000; // 200 Hz software PWM
-const unsigned long KICK_MS = 120;        // full-power startup kick
+const unsigned long KICK_MS = 120;        // brief 50%-boost startup window
 
 struct Motor {
   int pinA;
@@ -192,15 +192,18 @@ void serviceMotor(Motor &m) {
     return;
   }
 
-  bool fullPowerKick = millis() < m.kickUntil;
-
-  if (m.power >= 100 || fullPowerKick) {
+  if (m.power >= 100) {
     driveMotorRaw(m, true);
     return;
   }
 
+  int effectivePower = m.power;
+  if (millis() < m.kickUntil) {
+    effectivePower = min(100, (m.power * 150 + 50) / 100);
+  }
+
   unsigned long phase = micros() % PWM_PERIOD_US;
-  unsigned long onTime = (PWM_PERIOD_US * m.power) / 100;
+  unsigned long onTime = (PWM_PERIOD_US * effectivePower) / 100;
   bool pwmOn = phase < onTime;
 
   driveMotorRaw(m, pwmOn);
