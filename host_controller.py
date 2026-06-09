@@ -129,7 +129,7 @@ class PdController:
     def step(self, x_off, y_off, distance, dt):
         """Run one PD tick. Returns (L_pct, R_pct) ints in [-100, 100]."""
         head_err = 0.0 if (x_off == 0.0 and y_off == 0.0) \
-            else math.atan2(x_off, y_off)
+            else math.atan2(-x_off, y_off)
         dist_err = distance - self.stop_offset_mm
 
         if not self.initialized:
