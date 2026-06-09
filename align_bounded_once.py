@@ -46,6 +46,7 @@ def main() -> int:
     parser.add_argument("--duration", type=float, default=1.5)
     parser.add_argument("--target-dist", type=float, default=170.0)
     parser.add_argument("--vision-url", default="http://127.0.0.1:8080/status")
+    parser.add_argument("--min-confidence", type=int, default=55)
     parser.add_argument("--crawl-pwm", type=int, default=13)
     parser.add_argument("--turn-pwm", type=int, default=23)
     parser.add_argument("--frame-ms", type=int, default=150)
@@ -60,7 +61,7 @@ def main() -> int:
         + ".jsonl"
     )
 
-    vision = LiveBrickVision(args.vision_url)
+    vision = LiveBrickVision(args.vision_url, min_confidence=args.min_confidence)
     pd = PdController(args.target_dist)
     policy = CrawlCommandPolicy(
         straight_pwm=args.crawl_pwm,
@@ -86,6 +87,7 @@ def main() -> int:
             crawl_pwm=args.crawl_pwm,
             turn_pwm=args.turn_pwm,
             frame_ms=args.frame_ms,
+            min_confidence=args.min_confidence,
             before=before,
         )
 
