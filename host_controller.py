@@ -43,14 +43,16 @@ from urllib.request import urlopen
 WHEEL_BASE_MM        = 90.0
 MAX_WHEEL_SPEED_MMPS = 250.0
 
-# Stop at exactly 100 mm straight-line distance from the brick (x_off ≈ 0).
-# Updated from 7 mm to match Rich's target: x=0, dist=100mm, y=0.
-STOP_OFFSET_MM = 100.0
+# Step 1 currently stops 170 mm from the brick stack with x_off near zero.
+STOP_OFFSET_MM = 170.0
 
 KP_D = 5.0
 KD_D = 0.9
-KP_H = 200.0
+KP_H = 1200.0
 KD_H = 35.0
+HEADING_PRIORITY_X_MM = 25.0
+HEADING_FULL_TURN_X_MM = 90.0
+HEADING_MAX_PRIORITY = 0.65
 
 CTRL_HZ = 20
 
@@ -72,6 +74,12 @@ VISION_MIN_CONFIDENCE = 55      # matches align_to_brick.py default
 # Telemetry print rate
 PRINT_EVERY_N_TICKS = 5         # 20 Hz / 5 = 4 Hz log
 
+# Crawl output policy. Bun's validated low-speed straight command is 13% PWM.
+# One-wheel turn frames use 23% PWM because single-tread breakaway is higher.
+CRAWL_PWM = 13
+CRAWL_TURN_PWM = 23
+CRAWL_FRAME_S = 0.150
+
 
 # ---------------------------------------------------------------------------
 # Motor wiring calibration (host-side; no firmware change required)
@@ -91,16 +99,17 @@ PRINT_EVERY_N_TICKS = 5         # 20 Hz / 5 = 4 Hz log
 # For Bun's observed symptom set BOTH inversion flags to True (leave swap
 # False). Defaults are False so a fresh checkout assumes correct wiring.
 # ---------------------------------------------------------------------------
-INVERT_LEFT_MOTOR      = False
-INVERT_RIGHT_MOTOR     = False
-SWAP_LEFT_RIGHT_MOTORS = False
+INVERT_LEFT_MOTOR      = True
+INVERT_RIGHT_MOTOR     = True
+SWAP_LEFT_RIGHT_MOTORS = True
 
 
 # ---------------------------------------------------------------------------
 # PD controller — math identical to pd_simulator.pd_step
 # ---------------------------------------------------------------------------
 class PdController:
-    def __init__(self):
+    def __init__(self, stop_offset_mm=STOP_OFFSET_MM):
+        self.stop_offset_mm = float(stop_offset_mm)
         self.last_dist_err = 0.0
         self.last_head_err = 0.0
         self.initialized   = False
@@ -120,8 +129,8 @@ class PdController:
     def step(self, x_off, y_off, distance, dt):
         """Run one PD tick. Returns (L_pct, R_pct) ints in [-100, 100]."""
         head_err = 0.0 if (x_off == 0.0 and y_off == 0.0) \
-            else math.atan2(-x_off, y_off)
-        dist_err = distance - STOP_OFFSET_MM
+            else math.atan2(x_off, y_off)
+        dist_err = distance - self.stop_offset_mm
 
         if not self.initialized:
             self.last_dist_err = dist_err
@@ -139,6 +148,18 @@ class PdController:
         # accelerating — no fishtailing.
         v     = (KP_D * dist_err + KD_D * d_dist) * math.cos(head_err)
         omega = KP_H * head_err + KD_H * d_head
+
+        # At Bun's validated crawl speed, large lateral errors need heading
+        # authority first. This throttle fades out straight closure as x grows
+        # so the crawl policy emits more one-wheel zero frames instead of
+        # marching forward while the brick remains off-center.
+        if abs(x_off) > HEADING_PRIORITY_X_MM:
+            span = max(1.0, HEADING_FULL_TURN_X_MM - HEADING_PRIORITY_X_MM)
+            priority = min(
+                HEADING_MAX_PRIORITY,
+                (abs(x_off) - HEADING_PRIORITY_X_MM) / span,
+            )
+            v *= (1.0 - priority)
 
         # Mix to wheel speeds (W/2 is already absorbed into KP_H/KD_H).
         left  = v - omega
@@ -352,6 +373,103 @@ class DryRunLink:
         return None
 
 
+class CrawlCommandPolicy:
+    """Quantize PD wheel intent into Bun's validated crawl vocabulary.
+
+    Output commands are held for frame_s and each wheel is either stopped or
+    driven at the calibrated crawl PWM. One-wheel turn frames use a separately
+    calibrated turn PWM; two-wheel straight/arc frames stay at crawl PWM.
+    """
+    def __init__(self, straight_pwm=CRAWL_PWM, turn_pwm=CRAWL_TURN_PWM,
+                 frame_s=CRAWL_FRAME_S, pwm=None):
+        if pwm is not None:
+            straight_pwm = pwm
+        self.straight_pwm = int(straight_pwm)
+        self.turn_pwm = int(turn_pwm)
+        self.frame_s = float(frame_s)
+        self.next_frame_t = 0.0
+        self.current = (0, 0)
+        self.acc_l = 0.0
+        self.acc_r = 0.0
+
+    @staticmethod
+    def _sign(value):
+        if value > 0:
+            return 1
+        if value < 0:
+            return -1
+        return 0
+
+    def reset(self):
+        self.next_frame_t = 0.0
+        self.current = (0, 0)
+        self.acc_l = 0.0
+        self.acc_r = 0.0
+
+    def step(self, l_pct, r_pct, now):
+        if now < self.next_frame_t:
+            return self.current
+
+        self.next_frame_t = now + self.frame_s
+        l_pct = int(l_pct)
+        r_pct = int(r_pct)
+        max_abs = max(abs(l_pct), abs(r_pct))
+
+        if max_abs <= 0:
+            self.current = (0, 0)
+            self.acc_l = 0.0
+            self.acc_r = 0.0
+            return self.current
+
+        sign_l = self._sign(l_pct)
+        sign_r = self._sign(r_pct)
+        duty_l = abs(l_pct) / max_abs
+        duty_r = abs(r_pct) / max_abs
+
+        # Pure spin requests are converted into one-wheel arc turns. Bun has
+        # not validated counter-rotating tracks as a safe alignment primitive.
+        if sign_l and sign_r and sign_l != sign_r:
+            if abs(l_pct) > abs(r_pct):
+                duty_r = 0.0
+            elif abs(r_pct) > abs(l_pct):
+                duty_l = 0.0
+            elif r_pct > 0:
+                duty_l = 0.0
+            else:
+                duty_r = 0.0
+
+        out_l = self._dda("l", duty_l, sign_l)
+        out_r = self._dda("r", duty_r, sign_r)
+        if out_l and not out_r:
+            out_l = self._sign(out_l) * self.turn_pwm
+        elif out_r and not out_l:
+            out_r = self._sign(out_r) * self.turn_pwm
+        self.current = (out_l, out_r)
+        return self.current
+
+    def _dda(self, side, duty, sign):
+        if sign == 0 or duty <= 0.0:
+            return 0
+        if duty >= 0.98:
+            return sign * self.straight_pwm
+
+        if side == "l":
+            self.acc_l += duty
+            if self.acc_l >= 1.0:
+                self.acc_l -= 1.0
+                return sign * self.straight_pwm
+            return 0
+
+        self.acc_r += duty
+        if self.acc_r >= 1.0:
+            self.acc_r -= 1.0
+            return sign * self.straight_pwm
+        return 0
+
+
+Crawl12CommandPolicy = CrawlCommandPolicy
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -369,15 +487,34 @@ def main():
                     help=f"brick-vision /status endpoint (default {DEFAULT_VISION_URL})")
     ap.add_argument("--min-confidence", type=int, default=VISION_MIN_CONFIDENCE,
                     help="ignore detections below this confidence [0-100]")
+    ap.add_argument("--stop-offset", type=float, default=STOP_OFFSET_MM,
+                    help=f"target straight-line distance in mm (default {STOP_OFFSET_MM:.0f})")
+    ap.add_argument("--command-policy", choices=("raw", "crawl", "crawl12"),
+                    default="crawl",
+                    help="raw PD percentages or Bun's calibrated crawl frames")
+    ap.add_argument("--crawl-pwm", type=int, default=CRAWL_PWM,
+                    help=f"two-wheel PWM magnitude for crawl policy (default {CRAWL_PWM})")
+    ap.add_argument("--turn-pwm", type=int, default=CRAWL_TURN_PWM,
+                    help=f"one-wheel PWM magnitude for crawl policy (default {CRAWL_TURN_PWM})")
+    ap.add_argument("--crawl-frame-ms", type=int,
+                    default=int(CRAWL_FRAME_S * 1000),
+                    help=f"crawl command frame length in ms (default {int(CRAWL_FRAME_S * 1000)})")
     ap.add_argument("--dry-run", action="store_true",
                     help="no hardware; commands discarded but PD still runs")
     ap.add_argument("--no-vision", action="store_true",
                     help="skip the live camera and coast forever (smoke test)")
     args = ap.parse_args()
 
-    pd = PdController()
+    pd = PdController(args.stop_offset)
     vision = None if args.no_vision else LiveBrickVision(
         args.vision_url, args.min_confidence)
+    command_policy = None
+    if args.command_policy in ("crawl", "crawl12"):
+        command_policy = CrawlCommandPolicy(
+            straight_pwm=args.crawl_pwm,
+            turn_pwm=args.turn_pwm,
+            frame_s=max(1, args.crawl_frame_ms) / 1000.0,
+        )
 
     # Default to the known-good RouterBridge sketch; --dry-run wins if both
     # are unspecified together.
@@ -405,9 +542,11 @@ def main():
     tick   = 0
     last_state = "init"   # "tracking" | "lost" | "init"
 
-    print(f"[host] PD loop @ {CTRL_HZ} Hz | STOP_OFFSET={STOP_OFFSET_MM:.0f} mm | "
+    print(f"[host] PD loop @ {CTRL_HZ} Hz | STOP_OFFSET={args.stop_offset:.0f} mm | "
           f"vision={'off' if vision is None else args.vision_url} | "
-          f"transport={transport}. Ctrl-C to stop.")
+          f"transport={transport} | policy={args.command_policy} "
+          f"crawl_pwm={args.crawl_pwm} turn_pwm={args.turn_pwm} "
+          f"frame_ms={args.crawl_frame_ms}. Ctrl-C to stop.")
 
     try:
         while True:
@@ -423,10 +562,14 @@ def main():
                 # step. Sketch's 500 ms watchdog is the secondary fence.
                 l_pct, r_pct = 0, 0
                 pd.reset()
+                if command_policy is not None:
+                    command_policy.reset()
                 state = "lost"
             else:
                 x_off, y_off, dist = reading
                 l_pct, r_pct = pd.step(x_off, y_off, dist, dt)
+                if command_policy is not None:
+                    l_pct, r_pct = command_policy.step(l_pct, r_pct, now)
                 state = "tracking"
 
             # Hardware-wiring correction on the final outputs (see toggles
@@ -449,6 +592,8 @@ def main():
                     while not link.connect():
                         time.sleep(RECONNECT_WAIT_S)
                     pd.reset()
+                    if command_policy is not None:
+                        command_policy.reset()
                     continue
 
             tick += 1
