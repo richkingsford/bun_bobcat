@@ -80,6 +80,14 @@ CRAWL_PWM = 13
 CRAWL_TURN_PWM = 23
 CRAWL_FRAME_S = 0.150
 
+# Hard ceiling on the final wheel command, in percent of full duty, enforced
+# at the wire for EVERY command policy. Why: the raw PD path saturates both
+# wheels at 100% for any distance error beyond ~50 mm (KP_D = 5.0 against
+# the 250 mm/s per-wheel cap), which is the full-speed launch that crashed
+# Bun into the brick stack. The crawl policy tops out at CRAWL_TURN_PWM, so
+# this cap is a no-op there; keep MAX_SPEED_LIMIT above CRAWL_TURN_PWM.
+MAX_SPEED_LIMIT = 35
+
 
 # ---------------------------------------------------------------------------
 # Motor wiring calibration (host-side; no firmware change required)
@@ -582,6 +590,13 @@ def main():
                 l_pct = -l_pct
             if INVERT_RIGHT_MOTOR:
                 r_pct = -r_pct
+
+            # Last line of defence at the wire. Swap/invert only permute or
+            # negate, so this is magnitude-only, and it caps every command
+            # source above (raw PD, crawl frames, anything added later) so
+            # no policy or typo'd flag can launch the tracks past a crawl.
+            l_pct = max(-MAX_SPEED_LIMIT, min(MAX_SPEED_LIMIT, l_pct))
+            r_pct = max(-MAX_SPEED_LIMIT, min(MAX_SPEED_LIMIT, r_pct))
 
             if transport != "dry-run":
                 try:
