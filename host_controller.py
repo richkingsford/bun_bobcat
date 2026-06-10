@@ -36,6 +36,8 @@ import time
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from vision_autostart import ensure_stream
+
 
 # ---------------------------------------------------------------------------
 # Tunables — kept in lock-step with pd_simulator.py
@@ -514,8 +516,23 @@ def main():
     args = ap.parse_args()
 
     pd = PdController(args.stop_offset)
-    vision = None if args.no_vision else LiveBrickVision(
-        args.vision_url, args.min_confidence)
+    vision = None
+    stream_handle = None
+    if not args.no_vision:
+        vision = LiveBrickVision(args.vision_url, args.min_confidence)
+        # Aligning means we need the camera. Bring the stream up ourselves so a
+        # bare `python3 host_controller.py` just works; this no-ops when the
+        # stream is already serving (e.g. main.py launched it). Wait past
+        # stream.py's own device-wait so we don't enter the loop blind.
+        stream_handle = ensure_stream(
+            args.vision_url,
+            ready_timeout_s=30.0,
+            on_event=lambda ev, **f: print(f"[vision] {ev}"
+                                           + (f" {f}" if f else "")),
+        )
+        if not stream_handle.ready:
+            print("[vision] stream not serving yet — alignment will coast as "
+                  "'lost' until the OAK comes up (check the cable/replug).")
     command_policy = None
     if args.command_policy in ("crawl", "crawl12"):
         command_policy = CrawlCommandPolicy(
@@ -542,7 +559,10 @@ def main():
         try:
             time.sleep(RECONNECT_WAIT_S)
         except KeyboardInterrupt:
-            print(); return
+            print()
+            if stream_handle is not None:
+                stream_handle.stop()
+            return
 
     period = 1.0 / CTRL_HZ
     next_t = time.monotonic()
@@ -638,6 +658,10 @@ def main():
     finally:
         link.coast()
         link.close()
+        # Only tears down a stream WE started; leaves an externally-owned one
+        # (main.py, manual launch) running.
+        if stream_handle is not None:
+            stream_handle.stop()
 
 
 if __name__ == "__main__":

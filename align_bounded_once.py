@@ -18,6 +18,7 @@ from host_controller import (
     RpcLink,
     SWAP_LEFT_RIGHT_MOTORS,
 )
+from vision_autostart import ensure_stream
 
 
 def ts() -> str:
@@ -62,6 +63,17 @@ def main() -> int:
     )
 
     vision = LiveBrickVision(args.vision_url, min_confidence=args.min_confidence)
+    # This is a bounded run (often ~1.5 s), so the camera MUST be serving before
+    # the loop starts or we'd just log "lost" for the whole window. Bring the
+    # stream up ourselves (no-op if already running) and wait for it to be ready.
+    stream_handle = ensure_stream(
+        args.vision_url,
+        ready_timeout_s=30.0,
+        on_event=lambda ev, **f: write_jsonl(log_path, ev, **f),
+    )
+    if not stream_handle.ready:
+        write_jsonl(log_path, "vision_stream_not_ready", vision_url=args.vision_url)
+
     pd = PdController(args.target_dist)
     policy = CrawlCommandPolicy(
         straight_pwm=args.crawl_pwm,
@@ -71,6 +83,7 @@ def main() -> int:
     link = RpcLink()
     if not link.connect():
         write_jsonl(log_path, "link_failed")
+        stream_handle.stop()
         return 1
 
     best = None
@@ -176,6 +189,8 @@ def main() -> int:
             link.send(0, 0)
         finally:
             link.close()
+            # Stops only a stream this run started; leaves a shared one alone.
+            stream_handle.stop()
 
     return 0
 

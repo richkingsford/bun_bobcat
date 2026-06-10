@@ -2,7 +2,9 @@
 """Bun brick-vision livestream for the USB-connected OAK-D Lite."""
 
 import argparse
+import fcntl
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -35,6 +37,10 @@ AUX_FRAME_PERIOD_S = 0.5
 CLOSE_SIZE_MODEL_A = 59076.899536
 CLOSE_SIZE_MODEL_B = -10.031662
 CLOSE_SIZE_SWITCH_MM = 450
+DEVICE_WAIT_S = 25.0
+DEVICE_POLL_S = 1.0
+OAK_USB_VID = "03e7"
+USBDEVFS_RESET = (ord("U") << 8) | 20  # _IO('U', 20) from <linux/usbdevice_fs.h>
 
 
 HTML = """<!doctype html>
@@ -272,6 +278,78 @@ HTML = """<!doctype html>
 </body>
 </html>
 """
+
+
+def reset_wedged_oak():
+    """USB-reset any OAK (VID 03e7) on the bus that DepthAI can't open.
+
+    After a crashed run the OAK-D Lite often stays enumerated but wedged in a
+    booted/hung state, so getAllAvailableDevices() returns empty while lsusb
+    still lists it. A USBDEVFS_RESET frees it to re-enumerate as UNBOOTED.
+    Best-effort: needs write access to the device node, so it silently no-ops
+    when unprivileged. Returns the list of device nodes that were reset.
+    """
+    try:
+        listing = subprocess.run(
+            ["lsusb"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    reset_nodes = []
+    for line in listing.splitlines():
+        # Format: "Bus 001 Device 005: ID 03e7:2485 Intel Movidius MyriadX"
+        if f"{OAK_USB_VID}:" not in line.lower():
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            bus = int(parts[1])
+            dev = int(parts[3].rstrip(":"))
+        except ValueError:
+            continue
+        node = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+        try:
+            with open(node, "wb") as handle:
+                fcntl.ioctl(handle, USBDEVFS_RESET, 0)
+            reset_nodes.append(node)
+        except OSError:
+            # Permission denied or device already gone — leave it for a replug.
+            pass
+    return reset_nodes
+
+
+def wait_for_device(timeout_s=DEVICE_WAIT_S, poll_s=DEVICE_POLL_S):
+    """Poll for a DepthAI device up to timeout_s, recovering a wedged OAK once.
+
+    stream.py historically bailed on the first empty scan, so a camera that was
+    a few seconds slow to enumerate — or wedged from a prior run — read as "no
+    device". Polling (plus a one-shot USB reset) makes `python3 stream.py` come
+    up on its own once the OAK is connected, instead of needing manual re-runs.
+    """
+    deadline = time.monotonic() + timeout_s
+    attempted_reset = False
+    while True:
+        devices = dai.Device.getAllAvailableDevices()
+        if devices:
+            return devices
+
+        if not attempted_reset:
+            attempted_reset = True
+            nodes = reset_wedged_oak()
+            if nodes:
+                print(
+                    f"[vision] reset wedged OAK at {', '.join(nodes)}; "
+                    "waiting for re-enumeration",
+                    file=sys.stderr,
+                )
+                time.sleep(2.0)
+                continue
+
+        if time.monotonic() >= deadline:
+            return []
+        time.sleep(poll_s)
 
 
 def local_ip():
@@ -1041,11 +1119,21 @@ def main():
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help=f"stream width (default {DEFAULT_WIDTH})")
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT, help=f"stream height (default {DEFAULT_HEIGHT})")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help=f"camera FPS (default {DEFAULT_FPS:g})")
+    parser.add_argument(
+        "--device-wait",
+        type=float,
+        default=DEVICE_WAIT_S,
+        help=f"seconds to wait for the OAK to appear on USB (default {DEVICE_WAIT_S:g})",
+    )
     args = parser.parse_args()
 
-    devices = dai.Device.getAllAvailableDevices()
+    devices = wait_for_device(args.device_wait)
     if not devices:
-        print("[vision] no DepthAI/OAK device found on USB", file=sys.stderr)
+        print(
+            f"[vision] no DepthAI/OAK device found on USB after {args.device_wait:g}s "
+            "(check the cable / replug into a USB3 port)",
+            file=sys.stderr,
+        )
         return 1
 
     print("[vision] available DepthAI devices:")
