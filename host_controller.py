@@ -12,8 +12,9 @@ this controller.
 If the brick is lost — no detection, confidence below threshold, invalid
 spatial fix, or the HTTP poll fails — the controller transmits a coast
 command and clears the PD's derivative memory so the next valid
-reading doesn't fire a phantom d/dt spike on reacquisition. The sketch's
-500 ms watchdog is a second line of defence; this is the first.
+reading doesn't fire a phantom d/dt spike on reacquisition. The shipped
+sketch latches the last command (it has no watchdog), so this loop is
+the only line of defence and must never go quiet with tracks moving.
 
 PD math is bit-identical to pd_simulator.pd_step; gains are analytically
 tuned for ζ ≈ 1.5 (slightly overdamped) on both distance and heading loops
@@ -29,6 +30,7 @@ Usage:
 """
 
 import argparse
+from collections import deque
 import json
 import math
 from pathlib import Path
@@ -81,6 +83,66 @@ PRINT_EVERY_N_TICKS = 5         # 20 Hz / 5 = 4 Hz log
 CRAWL_PWM = 13
 CRAWL_TURN_PWM = 23
 CRAWL_FRAME_S = 0.150
+
+# ---------------------------------------------------------------------------
+# Step policy (default) -- burst-and-verify alignment.
+#
+# Why this exists: the June 10 live run ping-ponged on x (+67 mm -> -149 mm
+# -> +108 mm) until the brick left the frame. Two plant facts make blended
+# continuous steering unworkable at crawl speed:
+#   1. Single-tread motion is stiction-dominated. The firmware boost fires
+#      only on a start or direction change, so a *sustained* one-wheel
+#      command stalls and snaps (the log shows ~1.2 s of commanded pivot
+#      with x pinned at +67 mm, then a 66 mm jump in one frame).
+#   2. The camera reports where the brick WAS, not where it is. Re-deciding
+#      every 150 ms frame against a ~20 fps feed issues several turn frames
+#      per piece of evidence, so every zero-crossing overshoots.
+# The step policy therefore moves in short bursts that always start from
+# rest (every burst gets the firmware kick -> repeatable bite), then stops
+# and refuses to act again until at least one camera frame captured AFTER
+# the burst has arrived. Decisions use a median over the last 3 fresh
+# frames, so single-frame contour glitches (d jumped 177 -> 371 mm in the
+# log) can never steer the robot. Every emitted command stays inside the
+# validated vocabulary: 0, +/-STEP_SLOW_PWM straight, +/-STEP_FAST_PWM
+# straight (below the 25% both-tread case motor_diagnostic Test 1 ran
+# cleanly on June 8), and the existing one-wheel CRAWL_TURN_PWM frames.
+# ---------------------------------------------------------------------------
+STEP_SLOW_PWM         = CRAWL_PWM   # validated 13% two-tread crawl
+STEP_FAST_PWM         = 20          # far-field straight only; < tested 25%
+STEP_FAST_DIST_MM     = 250.0       # use FAST straight legs only beyond this
+STEP_X_HOLD_MM        = 5.0         # matches main.py X_TOL_MM success gate
+STEP_X_TRIM_EXIT_MM   = 7.0         # near aim exit, above the median-3
+                                    #   noise floor (sigma ~2.3 mm)
+STEP_X_REAIM_NEAR_MM  = 15.0        # near-field re-aim threshold
+STEP_X_FAR_ENTER_FRAC = 0.18        # far aim threshold ~= 10 deg bearing
+STEP_X_FAR_ENTER_MIN  = 30.0
+STEP_X_FAR_EXIT_FRAC  = 0.07        # far aim exit ~= 4 deg bearing
+STEP_X_FAR_EXIT_MIN   = 12.0
+STEP_RING_IN_MM       = 12.0        # hold band: stop-12 .. stop+18 mm, inside
+STEP_RING_OUT_MM      = 18.0        #   main.py's +/-20; deeper -> back out
+STEP_AIM_BURST_MAX_S  = 0.15        # one turn burst per decision, never more
+STEP_AIM_BURST_MIN_S  = 0.05        # one 20 Hz control tick
+STEP_BURST_S_PER_RAD  = 0.90        # burst length per radian of needed yaw
+                                    #   (~1/omega of a one-wheel kick burst)
+STEP_SETTLE_S         = 0.35        # post-burst: tracks stop, image sharpens
+STEP_LEG_FAR_S        = 1.20        # straight legs between re-aims
+STEP_LEG_NEAR_S       = 0.45
+STEP_LEG_CLOSE_S      = 0.30        # last ~60 mm before the ring
+STEP_LEG_SETTLE_S     = 0.25
+STEP_EST_FAST_MMPS    = 95.0        # conservative-high speed estimates used
+STEP_EST_SLOW_MMPS    = 60.0        #   only to cap leg length near the ring
+STEP_STALE_STOP_S     = 0.60        # moving with no fresh frame -> stop
+STEP_LOST_GRACE_S     = 0.40        # mid-leg confidence flicker tolerated
+STEP_SEEK_DELAY_S     = 2.0         # lost this long -> bounded reacquire scan
+STEP_SEEK_BURSTS      = 10          # max one-frame pivots toward last-seen x
+STEP_SEEK_LOOK_S      = 0.70
+STEP_MEDIAN_N         = 3
+STEP_JUMP_X_MM        = 60.0        # a parked robot rejects one frame whose
+STEP_JUMP_D_MM        = 90.0        #   x/d jumps this far (contour glitch)
+STEP_RING_WIN         = 6           # stationary samples judging the +/-5 mm
+STEP_RING_MIN_N       = 4           #   question (sigma ~3 mm per sample)
+STEP_X_REARM_MM       = 8.0         # parked: re-trim only past this margin
+STEP_HOLD_RECHECK_S   = 1.0         # parked: re-judge at most this often
 
 # Hard ceiling on the final wheel command, in percent of full duty, enforced
 # at the wire for EVERY command policy. Why: the raw PD path saturates both
@@ -216,6 +278,7 @@ class LiveBrickVision:
         self.timeout_s      = float(timeout_s)
         self.last_source    = "?"
         self.last_conf      = 0
+        self.last_frame_id  = 0
 
     @staticmethod
     def _normalize(url):
@@ -230,6 +293,15 @@ class LiveBrickVision:
                 payload = json.loads(resp.read().decode("utf-8"))
         except (OSError, URLError, json.JSONDecodeError, ValueError):
             return None
+
+        # /status "frames" counts captured camera frames. The step policy
+        # compares successive values to tell a genuinely new frame from a
+        # re-poll of the same one (the 20 Hz loop polls a ~20 fps stream),
+        # so it never issues two corrections on one piece of evidence.
+        try:
+            self.last_frame_id = int(payload.get("frames") or 0)
+        except (TypeError, ValueError):
+            pass
 
         det = payload.get("detection") or {}
         if not det.get("found"):
@@ -480,6 +552,305 @@ class CrawlCommandPolicy:
 Crawl12CommandPolicy = CrawlCommandPolicy
 
 
+class StepAligner:
+    """Burst-and-verify Step 1 alignment supervisor (command policy "step").
+
+    Emits only commands from Bun's validated vocabulary, always from rest so
+    the firmware kick makes each bite repeatable, and never issues a new
+    correction before seeing a camera frame captured after the previous one
+    finished. See the STEP_* tunables block for the failure analysis behind
+    the design.
+
+    step() is called every control tick with the latest vision sample (or
+    None) and returns (l_pct, r_pct, phase) in the PD sign convention; the
+    caller applies the wiring swap/invert and the MAX_SPEED_LIMIT cap
+    exactly as for every other policy.
+    """
+
+    def __init__(self, stop_offset_mm, turn_pwm=CRAWL_TURN_PWM,
+                 slow_pwm=STEP_SLOW_PWM, fast_pwm=STEP_FAST_PWM,
+                 settle_s=STEP_SETTLE_S, seek_enabled=True):
+        self.stop = float(stop_offset_mm)
+        self.turn_pwm = int(turn_pwm)
+        self.slow_pwm = int(slow_pwm)
+        self.fast_pwm = int(fast_pwm)
+        self.settle_s = float(settle_s)
+        self.seek_enabled = bool(seek_enabled)
+
+        self.phase = "acquire"
+        self.cmd = (0, 0)
+        self.aiming = False
+        self.plan_until = 0.0        # wall-clock end of the committed burst/leg
+        self.settle_until = 0.0
+        self.need_fresh_after = 0.0  # decisions wait for a frame after this
+
+        self.xs = deque(maxlen=STEP_MEDIAN_N)
+        self.ds = deque(maxlen=STEP_MEDIAN_N)
+        self.xs_ring = deque(maxlen=STEP_RING_WIN)  # stationary-only window
+        self.hold_recheck_t = 0.0
+        self.evidence_stale = False  # set on loss; clears the window on return
+        self.last_frame_id = object()  # sentinel: first real id always differs
+        self.last_fresh_t = 0.0
+        self.lost_since = None
+        self.last_x_sign = 0
+        self.seek_used = 0
+        self.outlier_strikes = 0
+        self.hold_announced = False
+
+    # -- helpers ------------------------------------------------------------
+    @staticmethod
+    def _median(values):
+        ordered = sorted(values)
+        return ordered[len(ordered) // 2]
+
+    def _stop(self, now, settle_s, phase):
+        self.cmd = (0, 0)
+        self.phase = phase
+        self.settle_until = now + settle_s
+        self.need_fresh_after = now
+
+    @staticmethod
+    def _plan(now, seconds):
+        # Commit to a whole number of control ticks. Ending a burst exactly
+        # ON a tick boundary lets loop jitter round every burst up by one
+        # tick (double rotation for a one-tick trim), which is the same
+        # overshoot disease the step policy exists to cure.
+        ticks = max(1, int(round(seconds * CTRL_HZ)))
+        return now + (ticks - 0.5) / CTRL_HZ
+
+    def _turn_cmd(self, x_sign):
+        # x > 0 means the brick sits right of center. The PD path maps that
+        # to a left-wheel one-wheel frame (verified on the wire in the
+        # June 10 log), so the supervisor keeps the identical mapping.
+        if x_sign > 0:
+            return (self.turn_pwm, 0)
+        return (0, self.turn_pwm)
+
+    def _aim_enter_mm(self, d):
+        if d <= self.stop + STEP_RING_OUT_MM:
+            return STEP_X_HOLD_MM
+        if d > STEP_FAST_DIST_MM:
+            return max(STEP_X_FAR_ENTER_MIN, STEP_X_FAR_ENTER_FRAC * d)
+        return STEP_X_REAIM_NEAR_MM
+
+    def _aim_exit_mm(self, d):
+        if d > STEP_FAST_DIST_MM:
+            return max(STEP_X_FAR_EXIT_MIN, STEP_X_FAR_EXIT_FRAC * d)
+        # Never demand a finer landing than one control tick of rotation
+        # can deliver, or the exit re-arms on its own minimum bite.
+        bite_mm = d / (STEP_BURST_S_PER_RAD * CTRL_HZ)
+        return max(STEP_X_TRIM_EXIT_MM, 0.8 * bite_mm)
+
+    def _trim(self, now, x_evidence, d):
+        # Size the burst to the yaw actually needed (small-angle x/d), so a
+        # close-range trim is one short bite, not a fixed frame that rotates
+        # past center and ping-pongs.
+        want_rad = min(0.35, abs(x_evidence) / max(d, 60.0))
+        burst = min(STEP_AIM_BURST_MAX_S,
+                    max(STEP_AIM_BURST_MIN_S,
+                        STEP_BURST_S_PER_RAD * want_rad))
+        self.cmd = self._turn_cmd(1 if x_evidence > 0 else -1)
+        self.phase = "aim"
+        self.xs_ring.clear()
+        self.plan_until = self._plan(now, burst)
+
+    def _decide_in_ring(self, now, d):
+        # Inside the ring the only question left is the +/-5 mm lateral
+        # gate, and a parked robot re-judging sigma ~3 mm samples on every
+        # 20 fps frame lets the noise tail fire within a second (the dither
+        # the first simulator runs showed). So: judge only on a window of
+        # stationary samples, grant hold at the gate width, and once parked
+        # re-trim only past a wider margin, at most once per cooldown.
+        self.aiming = False
+        if len(self.xs_ring) < STEP_RING_MIN_N:
+            self.cmd = (0, 0)
+            if self.phase != "hold":
+                self.phase = "settle"   # parked; gathering evidence
+            return
+        xe = self._median(self.xs_ring)
+        if self.phase == "hold":
+            if abs(xe) > STEP_X_REARM_MM and now >= self.hold_recheck_t:
+                self.hold_recheck_t = now + STEP_HOLD_RECHECK_S
+                self._trim(now, xe, d)
+            return
+        if abs(xe) <= STEP_X_HOLD_MM:
+            self.cmd = (0, 0)
+            self.phase = "hold"
+            self.hold_recheck_t = now + STEP_HOLD_RECHECK_S
+            if not self.hold_announced:
+                print(f"[host] step gate satisfied: d={d:.0f}mm "
+                      f"x={xe:+.0f}mm -- holding position.")
+                self.hold_announced = True
+            return
+        self._trim(now, xe, d)
+
+    # -- decision point: only ever reached standing still on fresh evidence --
+    def _decide(self, now):
+        if len(self.ds) < 2:
+            self._stop(now, 0.10, "acquire")
+            return
+        d = self._median(self.ds)
+        x = self._median(self.xs)
+        if x:
+            self.last_x_sign = 1 if x > 0 else -1
+
+        # Too deep: back straight out. Pivoting inside the ring is how the
+        # June 10 run lost the brick at d=135 mm.
+        if d < self.stop - STEP_RING_IN_MM:
+            self.aiming = False
+            self.cmd = (-self.slow_pwm, -self.slow_pwm)
+            self.phase = "backup"
+            self.xs_ring.clear()
+            self.plan_until = self._plan(now, STEP_LEG_CLOSE_S)
+            return
+
+        if d <= self.stop + STEP_RING_OUT_MM:
+            self._decide_in_ring(now, d)
+            return
+
+        threshold = self._aim_exit_mm(d) if self.aiming else self._aim_enter_mm(d)
+        if abs(x) > threshold:
+            self.aiming = True
+            self._trim(now, x, d)
+            return
+        self.aiming = False
+
+        # Straight leg toward the ring, length-capped so a leg can never
+        # carry the robot through the ring on stale evidence.
+        dist_to_go = d - self.stop
+        if dist_to_go <= 60.0:
+            leg_s, pwm, est = STEP_LEG_CLOSE_S, self.slow_pwm, STEP_EST_SLOW_MMPS
+        elif d <= STEP_FAST_DIST_MM:
+            leg_s, pwm, est = STEP_LEG_NEAR_S, self.slow_pwm, STEP_EST_SLOW_MMPS
+        else:
+            leg_s, pwm, est = STEP_LEG_FAR_S, self.fast_pwm, STEP_EST_FAST_MMPS
+        budget_mm = d - (self.stop + STEP_RING_OUT_MM) - 10.0
+        if budget_mm > 0:
+            leg_s = min(leg_s, max(0.15, budget_mm / est))
+        self.cmd = (pwm, pwm)
+        self.phase = "drive"
+        self.xs_ring.clear()
+        self.plan_until = self._plan(now, leg_s)
+
+    # -- lost handling: coast, then a bounded reacquire scan -----------------
+    def _lost(self, now, lost_for):
+        self.evidence_stale = True
+        if self.phase == "hold":
+            # Gate already satisfied. A confidence flicker at rest must not
+            # un-park the robot; staying put is the only move that cannot
+            # make things worse.
+            return 0, 0, "hold"
+        if self.cmd != (0, 0) and self.phase != "seek":
+            self._stop(now, self.settle_s, "seek_wait")
+            return 0, 0, self.phase
+        if self.phase == "seek":
+            if now < self.plan_until:
+                return self.cmd[0], self.cmd[1], "seek"
+            self.cmd = (0, 0)
+            self.phase = "seek_wait"
+            self.settle_until = now + STEP_SEEK_LOOK_S
+            return 0, 0, self.phase
+        if (not self.seek_enabled) or self.last_x_sign == 0:
+            self.phase = "lost_coast"
+            return 0, 0, self.phase
+        if lost_for < STEP_SEEK_DELAY_S or now < self.settle_until:
+            self.phase = "seek_wait"
+            return 0, 0, self.phase
+        if self.seek_used >= STEP_SEEK_BURSTS:
+            self.phase = "seek_done"
+            return 0, 0, self.phase
+        # One pivot frame toward where the brick was last seen, then look.
+        self.seek_used += 1
+        self.cmd = self._turn_cmd(self.last_x_sign)
+        self.phase = "seek"
+        self.xs_ring.clear()
+        self.plan_until = self._plan(now, STEP_AIM_BURST_MAX_S)
+        return self.cmd[0], self.cmd[1], self.phase
+
+    # -- per-tick entry point -------------------------------------------------
+    def step(self, sample, now):
+        if sample is None:
+            if self.lost_since is None:
+                self.lost_since = now
+            lost_for = now - self.lost_since
+            # Let a committed burst/leg finish through a brief confidence
+            # flicker; plan_until bounds it and the wire cap bounds the power.
+            if (lost_for <= STEP_LOST_GRACE_S and self.cmd != (0, 0)
+                    and now < self.plan_until):
+                return self.cmd[0], self.cmd[1], self.phase
+            return self._lost(now, lost_for)
+
+        self.lost_since = None
+        frame_id = sample.get("frame_id")
+        if frame_id != self.last_frame_id:
+            self.last_frame_id = frame_id
+            if self.evidence_stale:
+                # The world may have changed during the blackout; an old
+                # median must never steer the first post-loss correction.
+                self.xs.clear()
+                self.ds.clear()
+                self.xs_ring.clear()
+                self.evidence_stale = False
+            x_new = float(sample["x"])
+            d_new = float(sample["dist"])
+            if (self.cmd == (0, 0) and self.outlier_strikes == 0 and self.ds
+                    and (abs(x_new - self._median(self.xs)) > STEP_JUMP_X_MM
+                         or abs(d_new - self._median(self.ds)) > STEP_JUMP_D_MM)):
+                # A parked robot cannot teleport. One frame that jumps this
+                # far is the contour glitch from the June 10 log (d spiked
+                # 177 -> 371 mm); two in a row means the world really
+                # changed, so only the first is dropped.
+                self.outlier_strikes = 1
+            else:
+                self.outlier_strikes = 0
+                self.xs.append(x_new)
+                self.ds.append(d_new)
+                if self.cmd == (0, 0) and now >= self.settle_until:
+                    # Settle exceeds camera latency, so frames landing here
+                    # were captured with the robot genuinely at rest.
+                    self.xs_ring.append(x_new)
+            self.last_fresh_t = now
+            if self.phase in ("seek", "seek_wait", "seek_done", "lost_coast"):
+                self.seek_used = 0
+                self._stop(now, 0.15, "acquire")
+                return 0, 0, self.phase
+
+        # Never keep moving on stale evidence.
+        if self.cmd != (0, 0) and (now - self.last_fresh_t) > STEP_STALE_STOP_S:
+            self._stop(now, self.settle_s, "settle")
+            return 0, 0, self.phase
+
+        if self.phase == "aim":
+            if now < self.plan_until:
+                return self.cmd[0], self.cmd[1], self.phase
+            self._stop(now, self.settle_s, "settle")
+            return 0, 0, self.phase
+
+        if self.phase in ("drive", "backup"):
+            d = self._median(self.ds)
+            x = self._median(self.xs)
+            ended = now >= self.plan_until
+            if self.phase == "drive":
+                if d <= self.stop + STEP_RING_OUT_MM + 10.0:
+                    ended = True
+                if abs(x) > self._aim_enter_mm(d):
+                    ended = True
+            elif d >= self.stop - STEP_RING_IN_MM + 2.0:
+                ended = True
+            if not ended:
+                return self.cmd[0], self.cmd[1], self.phase
+            self._stop(now, STEP_LEG_SETTLE_S, "settle")
+            return 0, 0, self.phase
+
+        # settle / acquire / hold: decide only once stopped, settled, and a
+        # frame captured after the last motion has arrived.
+        if (now >= self.settle_until
+                and self.last_fresh_t >= self.need_fresh_after
+                and len(self.ds) >= 2):
+            self._decide(now)
+        return self.cmd[0], self.cmd[1], self.phase
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -499,9 +870,12 @@ def main():
                     help="ignore detections below this confidence [0-100]")
     ap.add_argument("--stop-offset", type=float, default=STOP_OFFSET_MM,
                     help=f"target straight-line distance in mm (default {STOP_OFFSET_MM:.0f})")
-    ap.add_argument("--command-policy", choices=("raw", "crawl", "crawl12"),
-                    default="crawl",
-                    help="raw PD percentages or Bun's calibrated crawl frames")
+    ap.add_argument("--command-policy",
+                    choices=("raw", "crawl", "crawl12", "step"),
+                    default="step",
+                    help="step = burst-and-verify aligner (default); "
+                         "crawl = continuous calibrated frames; "
+                         "raw = unshaped PD percentages")
     ap.add_argument("--crawl-pwm", type=int, default=CRAWL_PWM,
                     help=f"two-wheel PWM magnitude for crawl policy (default {CRAWL_PWM})")
     ap.add_argument("--turn-pwm", type=int, default=CRAWL_TURN_PWM,
@@ -509,6 +883,15 @@ def main():
     ap.add_argument("--crawl-frame-ms", type=int,
                     default=int(CRAWL_FRAME_S * 1000),
                     help=f"crawl command frame length in ms (default {int(CRAWL_FRAME_S * 1000)})")
+    ap.add_argument("--step-fast-pwm", type=int, default=STEP_FAST_PWM,
+                    help="step policy: straight PWM for far-field legs "
+                         f"(default {STEP_FAST_PWM}; wire cap still applies)")
+    ap.add_argument("--step-settle-ms", type=int,
+                    default=int(STEP_SETTLE_S * 1000),
+                    help="step policy: post-burst settle before the next "
+                         f"decision (default {int(STEP_SETTLE_S * 1000)} ms)")
+    ap.add_argument("--no-seek", action="store_true",
+                    help="step policy: disable the bounded lost-brick scan")
     ap.add_argument("--dry-run", action="store_true",
                     help="no hardware; commands discarded but PD still runs")
     ap.add_argument("--no-vision", action="store_true",
@@ -534,7 +917,16 @@ def main():
             print("[vision] stream not serving yet — alignment will coast as "
                   "'lost' until the OAK comes up (check the cable/replug).")
     command_policy = None
-    if args.command_policy in ("crawl", "crawl12"):
+    step_policy = None
+    if args.command_policy == "step":
+        step_policy = StepAligner(
+            args.stop_offset,
+            turn_pwm=args.turn_pwm,
+            fast_pwm=args.step_fast_pwm,
+            settle_s=max(1, args.step_settle_ms) / 1000.0,
+            seek_enabled=not args.no_seek,
+        )
+    elif args.command_policy in ("crawl", "crawl12"):
         command_policy = CrawlCommandPolicy(
             straight_pwm=args.crawl_pwm,
             turn_pwm=args.turn_pwm,
@@ -552,7 +944,8 @@ def main():
         link = DryRunLink()
 
     # Don't enter the loop blind. Sending phantom commands while the
-    # transport is down only hides bugs; the sketch's watchdog will coast.
+    # transport is down only hides bugs, and the shipped sketch has no
+    # watchdog to coast for us.
     while not link.connect():
         print(f"[{transport}] retrying in {RECONNECT_WAIT_S:.1f}s "
               "(Ctrl-C to abort)...")
@@ -584,10 +977,27 @@ def main():
 
             reading = None if vision is None else vision.read()
 
-            if reading is None:
+            step_phase = ""
+            if step_policy is not None:
+                # Burst-and-verify supervisor. It owns motion timing, so it
+                # consumes the raw sample (plus the camera frame counter for
+                # freshness) instead of a per-tick PD output. state stays
+                # "tracking"/"lost" so main.py's telemetry regex still binds.
+                if reading is None:
+                    sample = None
+                    state = "lost"
+                else:
+                    x_off, y_off, dist = reading
+                    sample = {"x": x_off, "dist": dist,
+                              "frame_id": vision.last_frame_id}
+                    state = "tracking"
+                l_pct, r_pct, step_phase = step_policy.step(sample, now)
+            elif reading is None:
                 # Vision lost (or disabled) → coast and clear PD memory so
                 # the next valid reading isn't seen as a giant derivative
-                # step. Sketch's 500 ms watchdog is the secondary fence.
+                # step. The shipped sketch latches the last command (no
+                # firmware watchdog), so this loop must never go quiet
+                # with the tracks moving.
                 l_pct, r_pct = 0, 0
                 pd.reset()
                 if command_policy is not None:
@@ -633,15 +1043,19 @@ def main():
 
             tick += 1
             if tick % PRINT_EVERY_N_TICKS == 0 or state != last_state:
+                # Appended AFTER every field main.py's TELEMETRY_RE binds to,
+                # so the 20-trial scoreboard parses these lines unchanged.
+                phase_sfx = f" phase={step_phase}" if step_phase else ""
                 if reading is None:
                     print(f"  [{state}]  L={l_pct:+4d}  R={r_pct:+4d}  "
-                          f"(no valid brick)")
+                          f"(no valid brick){phase_sfx}")
                 else:
                     x_off, y_off, dist = reading
                     print(f"  [{state}]  d={dist:7.2f}mm  "
                           f"x={x_off:+7.2f}  y_fwd={y_off:+7.2f}  "
                           f"L={l_pct:+4d}  R={r_pct:+4d}  "
-                          f"src={vision.last_source} conf={vision.last_conf}")
+                          f"src={vision.last_source} conf={vision.last_conf}"
+                          f"{phase_sfx}")
             last_state = state
 
             # Pace at CTRL_HZ; re-baseline if we ever fall behind so we
