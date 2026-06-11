@@ -127,7 +127,7 @@ def launch_host(args: argparse.Namespace) -> subprocess.Popen:
         "--stop-offset",
         str(args.target_dist),
         "--command-policy",
-        "crawl",
+        "step",
         "--crawl-pwm",
         str(args.crawl_pwm),
         "--turn-pwm",
