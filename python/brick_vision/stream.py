@@ -37,7 +37,7 @@ AUX_FRAME_PERIOD_S = 0.5
 CLOSE_SIZE_MODEL_A = 59076.899536
 CLOSE_SIZE_MODEL_B = -10.031662
 CLOSE_SIZE_SWITCH_MM = 450
-DEVICE_WAIT_S = 25.0
+DEVICE_WAIT_S = 45.0
 DEVICE_POLL_S = 1.0
 OAK_USB_VID = "03e7"
 USBDEVFS_RESET = (ord("U") << 8) | 20  # _IO('U', 20) from <linux/usbdevice_fs.h>
@@ -453,6 +453,12 @@ class BrickDetector:
         col_run = self._largest_true_run(good_cols)
         if row_run is None or col_run is None:
             return x, y, w, h, int(np.count_nonzero(body))
+        if w >= 180:
+            row_idx = np.flatnonzero(good_rows)
+            col_idx = np.flatnonzero(good_cols)
+            if row_idx.size and col_idx.size:
+                row_run = (int(row_idx[0]), int(row_idx[-1]) + 1)
+                col_run = (int(col_idx[0]), int(col_idx[-1]) + 1)
 
         pad = 3
         y0 = max(0, row_run[0] - pad)
@@ -566,13 +572,27 @@ class BrickDetector:
         notches.sort(key=lambda item: item["area"], reverse=True)
         return notches[:8]
 
-    def _choose_brick_contour(self, contours):
+    def _choose_brick_contour(self, contours, frame_shape):
         best = None
+        best_box = None
         best_score = -1.0
+        candidates = []
+        frame_h, frame_w = frame_shape[:2]
+        edge_margin = 3
         for contour in contours:
             area = cv2.contourArea(contour)
             x, y, w, h = cv2.boundingRect(contour)
             if w < 50 or h < 50:
+                continue
+            touches_side = x <= edge_margin or x + w >= frame_w - edge_margin
+            touches_bottom = y + h >= frame_h - edge_margin
+            top_clipped_large_target = (
+                y <= edge_margin
+                and w >= 160
+                and h >= 140
+                and area >= 20000
+            )
+            if touches_side or touches_bottom or (y <= edge_margin and not top_clipped_large_target):
                 continue
 
             aspect = w / max(1, h)
@@ -586,10 +606,30 @@ class BrickDetector:
             if aspect > 1.65 or extent < 0.5:
                 score -= 1.0
 
+            candidates.append((score, contour, (x, y, w, h)))
             if score > best_score:
                 best_score = score
                 best = contour
-        return best
+                best_box = (x, y, w, h)
+
+        if best is None or best_box is None:
+            return None
+
+        bx, _by, bw, _bh = best_box
+        b0, b1 = bx, bx + bw
+        b_center = bx + bw / 2.0
+        merged = []
+        for _score, contour, (x, y, w, h) in candidates:
+            c0, c1 = x, x + w
+            overlap = max(0, min(b1, c1) - max(b0, c0))
+            overlap_ratio = overlap / max(1, min(bw, w))
+            center_close = abs((x + w / 2.0) - b_center) <= max(bw, w) * 0.35
+            if overlap_ratio >= 0.45 or center_close:
+                merged.append(contour)
+
+        if len(merged) <= 1:
+            return best
+        return cv2.convexHull(np.vstack(merged))
 
     def _estimate_spatial(self, mask, contour, depth, intrinsics, bbox=None):
         if intrinsics is None:
@@ -745,7 +785,7 @@ class BrickDetector:
                 "notches": [],
             }
 
-        contour = self._choose_brick_contour(contours)
+        contour = self._choose_brick_contour(contours, mask.shape)
         if contour is None:
             draw_label(overlay, "brick: searching", 16, 32, (180, 190, 200))
             return overlay, {

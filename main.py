@@ -24,6 +24,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from host_controller import RpcLink
+from vision_autostart import ensure_stream
 
 
 TARGET_DIST_MM = 170.0
@@ -75,33 +76,18 @@ def vision_is_running(vision_url: str) -> bool:
 
 
 def launch_stream(log: JsonlLog, vision_url: str) -> subprocess.Popen | None:
-    if vision_is_running(vision_url):
-        log.write("stream_already_running", vision_url=vision_url)
-        return None
-
     stream_log = Path("logs/step1_master/stream_latest.log")
-    stream_log.parent.mkdir(parents=True, exist_ok=True)
-    f = stream_log.open("a", encoding="utf-8")
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "python/brick_vision/stream.py"],
-        stdout=f,
-        stderr=subprocess.STDOUT,
-        text=True,
+    handle = ensure_stream(
+        vision_url,
+        ready_timeout_s=45.0,
+        log_path=stream_log,
+        usb_settle_s=25.0,
+        start_attempts=2,
+        on_event=lambda event, **fields: log.write(event, **fields),
     )
-    log.write("stream_launch", pid=proc.pid, log_path=str(stream_log))
-
-    deadline = time.monotonic() + 8.0
-    while time.monotonic() < deadline:
-        if vision_is_running(vision_url):
-            log.write("stream_ready", vision_url=vision_url)
-            return proc
-        if proc.poll() is not None:
-            log.write("stream_exited", returncode=proc.returncode, log_path=str(stream_log))
-            return proc
-        time.sleep(0.25)
-
-    log.write("stream_not_ready", pid=proc.pid, log_path=str(stream_log))
-    return proc
+    if not handle.ready:
+        log.write("stream_unavailable", log_path=str(stream_log))
+    return handle.proc if handle.started else None
 
 
 def terminate_process(proc: subprocess.Popen | None, timeout_s: float = 2.0) -> None:

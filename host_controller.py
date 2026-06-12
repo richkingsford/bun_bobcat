@@ -56,7 +56,7 @@ KP_H = 1200.0
 KD_H = 35.0
 HEADING_PRIORITY_X_MM = 25.0
 HEADING_FULL_TURN_X_MM = 90.0
-HEADING_MAX_PRIORITY = 0.65
+HEADING_MAX_PRIORITY = 0.45
 
 CTRL_HZ = 20
 
@@ -73,7 +73,7 @@ ARDUINO_RESET_WAIT_S  = 2.0   # USB-CDC reset window after open
 DEFAULT_VISION_URL    = "http://127.0.0.1:8080/status"
 VISION_TIMEOUT_S      = 0.040   # < one 50 ms control period; a slow vision
                                 # response must not stall the PD tick.
-VISION_MIN_CONFIDENCE = 55      # matches align_to_brick.py default
+VISION_MIN_CONFIDENCE = 40      # close-range centered locks often score low-40s
 
 # Telemetry print rate
 PRINT_EVERY_N_TICKS = 5         # 20 Hz / 5 = 4 Hz log
