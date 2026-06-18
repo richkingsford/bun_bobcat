@@ -922,6 +922,7 @@ def main():
         step_policy = StepAligner(
             args.stop_offset,
             turn_pwm=args.turn_pwm,
+            slow_pwm=args.crawl_pwm,
             fast_pwm=args.step_fast_pwm,
             settle_s=max(1, args.step_settle_ms) / 1000.0,
             seek_enabled=not args.no_seek,
