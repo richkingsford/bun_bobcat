@@ -2,7 +2,9 @@
 """Bun brick-vision livestream for the USB-connected OAK-D Lite."""
 
 import argparse
+import fcntl
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +24,8 @@ JPEG_QUALITY = 82
 STREAM_SLEEP_S = 0.02
 GREEN_LOWER_HSV = np.array([38, 65, 45])
 GREEN_UPPER_HSV = np.array([95, 255, 255])
+BODY_MIN_S = 145
+BODY_MIN_V = 105
 MIN_BRICK_AREA = 4000
 HEX_SAMPLE_COUNT = 12
 HEX_SAMPLE_PERIOD_S = 2.0
@@ -33,6 +37,10 @@ AUX_FRAME_PERIOD_S = 0.5
 CLOSE_SIZE_MODEL_A = 59076.899536
 CLOSE_SIZE_MODEL_B = -10.031662
 CLOSE_SIZE_SWITCH_MM = 450
+DEVICE_WAIT_S = 45.0
+DEVICE_POLL_S = 1.0
+OAK_USB_VID = "03e7"
+USBDEVFS_RESET = (ord("U") << 8) | 20  # _IO('U', 20) from <linux/usbdevice_fs.h>
 
 
 HTML = """<!doctype html>
@@ -272,6 +280,78 @@ HTML = """<!doctype html>
 """
 
 
+def reset_wedged_oak():
+    """USB-reset any OAK (VID 03e7) on the bus that DepthAI can't open.
+
+    After a crashed run the OAK-D Lite often stays enumerated but wedged in a
+    booted/hung state, so getAllAvailableDevices() returns empty while lsusb
+    still lists it. A USBDEVFS_RESET frees it to re-enumerate as UNBOOTED.
+    Best-effort: needs write access to the device node, so it silently no-ops
+    when unprivileged. Returns the list of device nodes that were reset.
+    """
+    try:
+        listing = subprocess.run(
+            ["lsusb"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    reset_nodes = []
+    for line in listing.splitlines():
+        # Format: "Bus 001 Device 005: ID 03e7:2485 Intel Movidius MyriadX"
+        if f"{OAK_USB_VID}:" not in line.lower():
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            bus = int(parts[1])
+            dev = int(parts[3].rstrip(":"))
+        except ValueError:
+            continue
+        node = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+        try:
+            with open(node, "wb") as handle:
+                fcntl.ioctl(handle, USBDEVFS_RESET, 0)
+            reset_nodes.append(node)
+        except OSError:
+            # Permission denied or device already gone — leave it for a replug.
+            pass
+    return reset_nodes
+
+
+def wait_for_device(timeout_s=DEVICE_WAIT_S, poll_s=DEVICE_POLL_S):
+    """Poll for a DepthAI device up to timeout_s, recovering a wedged OAK once.
+
+    stream.py historically bailed on the first empty scan, so a camera that was
+    a few seconds slow to enumerate — or wedged from a prior run — read as "no
+    device". Polling (plus a one-shot USB reset) makes `python3 stream.py` come
+    up on its own once the OAK is connected, instead of needing manual re-runs.
+    """
+    deadline = time.monotonic() + timeout_s
+    attempted_reset = False
+    while True:
+        devices = dai.Device.getAllAvailableDevices()
+        if devices:
+            return devices
+
+        if not attempted_reset:
+            attempted_reset = True
+            nodes = reset_wedged_oak()
+            if nodes:
+                print(
+                    f"[vision] reset wedged OAK at {', '.join(nodes)}; "
+                    "waiting for re-enumeration",
+                    file=sys.stderr,
+                )
+                time.sleep(2.0)
+                continue
+
+        if time.monotonic() >= deadline:
+            return []
+        time.sleep(poll_s)
+
+
 def local_ip():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         try:
@@ -313,9 +393,91 @@ class BrickDetector:
         self.hex_colors = []
         self.last_hex_sample_t = 0.0
 
-    def _sample_hex_colors(self, frame, mask, contour):
+    def _largest_true_run(self, values):
+        best_start = None
+        best_len = 0
+        start = None
+
+        for index, value in enumerate(values):
+            if value:
+                if start is None:
+                    start = index
+            elif start is not None:
+                run_len = index - start
+                if run_len > best_len:
+                    best_start = start
+                    best_len = run_len
+                start = None
+
+        if start is not None:
+            run_len = len(values) - start
+            if run_len > best_len:
+                best_start = start
+                best_len = run_len
+
+        if best_start is None:
+            return None
+        return best_start, best_start + best_len
+
+    def _solid_body_bbox(self, mask, contour, hsv=None):
+        x, y, w, h = cv2.boundingRect(contour)
+        roi_green = mask[y:y + h, x:x + w]
+        silhouette = np.zeros_like(roi_green)
+        cv2.drawContours(silhouette, [contour - np.array([x, y])], -1, 255, cv2.FILLED)
+        body = cv2.bitwise_and(roi_green, silhouette)
+        body = cv2.morphologyEx(body, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+        core = body
+        if hsv is not None:
+            hsv_roi = hsv[y:y + h, x:x + w]
+            strong_color = (
+                (hsv_roi[:, :, 1] >= BODY_MIN_S)
+                & (hsv_roi[:, :, 2] >= BODY_MIN_V)
+            )
+            core = np.zeros_like(body)
+            core[(body > 0) & strong_color] = 255
+            core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+            if cv2.countNonZero(core) < 50:
+                core = body
+
+        row_counts = np.count_nonzero(core, axis=1)
+        col_counts = np.count_nonzero(core, axis=0)
+        if row_counts.size == 0 or col_counts.size == 0 or row_counts.max() == 0 or col_counts.max() == 0:
+            return x, y, w, h, int(cv2.contourArea(contour))
+
+        row_threshold = max(8, int(round(row_counts.max() * 0.22)))
+        col_threshold = max(8, int(round(col_counts.max() * 0.22)))
+        good_rows = row_counts >= row_threshold
+        good_cols = col_counts >= col_threshold
+
+        row_run = self._largest_true_run(good_rows)
+        col_run = self._largest_true_run(good_cols)
+        if row_run is None or col_run is None:
+            return x, y, w, h, int(np.count_nonzero(body))
+        if w >= 180:
+            row_idx = np.flatnonzero(good_rows)
+            col_idx = np.flatnonzero(good_cols)
+            if row_idx.size and col_idx.size:
+                row_run = (int(row_idx[0]), int(row_idx[-1]) + 1)
+                col_run = (int(col_idx[0]), int(col_idx[-1]) + 1)
+
+        pad = 3
+        y0 = max(0, row_run[0] - pad)
+        y1 = min(h, row_run[1] + pad)
+        x0 = max(0, col_run[0] - pad)
+        x1 = min(w, col_run[1] + pad)
+        bw = max(1, x1 - x0)
+        bh = max(1, y1 - y0)
+        body_area = int(np.count_nonzero(body[y0:y1, x0:x1]))
+        return x + x0, y + y0, bw, bh, body_area
+
+    def _sample_hex_colors(self, frame, mask, contour, bbox=None):
         contour_mask = np.zeros(mask.shape, np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, cv2.FILLED)
+        if bbox is not None:
+            x, y, w, h = bbox
+            bbox_mask = np.zeros(mask.shape, np.uint8)
+            bbox_mask[y:y + h, x:x + w] = 255
+            contour_mask = cv2.bitwise_and(contour_mask, bbox_mask)
         pixels = frame[(mask > 0) & (contour_mask > 0)]
         if len(pixels) == 0:
             return []
@@ -339,9 +501,14 @@ class BrickDetector:
             colors.append({"hex": rgb_to_hex(center), "count": int(counts[index])})
         return colors
 
-    def _find_notches(self, mask, contour):
-        x, y, w, h = cv2.boundingRect(contour)
+    def _find_notches(self, mask, contour, bbox=None):
+        if bbox is None:
+            x, y, w, h = cv2.boundingRect(contour)
+        else:
+            x, y, w, h = bbox
         roi_green = mask[y:y + h, x:x + w]
+        if roi_green.size == 0:
+            return []
         silhouette = np.zeros_like(roi_green)
         cv2.drawContours(silhouette, [contour - np.array([x, y])], -1, 255, cv2.FILLED)
         silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_CLOSE, np.ones((35, 35), np.uint8), iterations=1)
@@ -405,13 +572,27 @@ class BrickDetector:
         notches.sort(key=lambda item: item["area"], reverse=True)
         return notches[:8]
 
-    def _choose_brick_contour(self, contours):
+    def _choose_brick_contour(self, contours, frame_shape):
         best = None
+        best_box = None
         best_score = -1.0
+        candidates = []
+        frame_h, frame_w = frame_shape[:2]
+        edge_margin = 3
         for contour in contours:
             area = cv2.contourArea(contour)
             x, y, w, h = cv2.boundingRect(contour)
             if w < 50 or h < 50:
+                continue
+            touches_side = x <= edge_margin or x + w >= frame_w - edge_margin
+            touches_bottom = y + h >= frame_h - edge_margin
+            top_clipped_large_target = (
+                y <= edge_margin
+                and w >= 160
+                and h >= 140
+                and area >= 20000
+            )
+            if touches_side or touches_bottom or (y <= edge_margin and not top_clipped_large_target):
                 continue
 
             aspect = w / max(1, h)
@@ -425,12 +606,32 @@ class BrickDetector:
             if aspect > 1.65 or extent < 0.5:
                 score -= 1.0
 
+            candidates.append((score, contour, (x, y, w, h)))
             if score > best_score:
                 best_score = score
                 best = contour
-        return best
+                best_box = (x, y, w, h)
 
-    def _estimate_spatial(self, mask, contour, depth, intrinsics):
+        if best is None or best_box is None:
+            return None
+
+        bx, _by, bw, _bh = best_box
+        b0, b1 = bx, bx + bw
+        b_center = bx + bw / 2.0
+        merged = []
+        for _score, contour, (x, y, w, h) in candidates:
+            c0, c1 = x, x + w
+            overlap = max(0, min(b1, c1) - max(b0, c0))
+            overlap_ratio = overlap / max(1, min(bw, w))
+            center_close = abs((x + w / 2.0) - b_center) <= max(bw, w) * 0.35
+            if overlap_ratio >= 0.45 or center_close:
+                merged.append(contour)
+
+        if len(merged) <= 1:
+            return best
+        return cv2.convexHull(np.vstack(merged))
+
+    def _estimate_spatial(self, mask, contour, depth, intrinsics, bbox=None):
         if intrinsics is None:
             return {
                 "valid": False,
@@ -438,7 +639,10 @@ class BrickDetector:
                 "axis_convention": "x right, y down, dist forward from RGB optical center",
             }
 
-        x, y, w, h = cv2.boundingRect(contour)
+        if bbox is None:
+            x, y, w, h = cv2.boundingRect(contour)
+        else:
+            x, y, w, h = bbox
         center_u = x + w / 2.0
         center_v = y + h / 2.0
         fx = float(intrinsics[0][0])
@@ -484,9 +688,15 @@ class BrickDetector:
         contour_mask = np.zeros(mask.shape, np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, cv2.FILLED)
         spatial_mask = cv2.bitwise_and(mask, contour_mask)
+        if bbox is not None:
+            bbox_mask = np.zeros(mask.shape, np.uint8)
+            bbox_mask[y:y + h, x:x + w] = 255
+            spatial_mask = cv2.bitwise_and(spatial_mask, bbox_mask)
         spatial_mask = cv2.erode(spatial_mask, np.ones((5, 5), np.uint8), iterations=1)
         if cv2.countNonZero(spatial_mask) < 50:
             spatial_mask = cv2.bitwise_and(mask, contour_mask)
+            if bbox is not None:
+                spatial_mask = cv2.bitwise_and(spatial_mask, bbox_mask)
 
         depth_values = depth[spatial_mask > 0]
         depth_values = depth_values[
@@ -575,7 +785,7 @@ class BrickDetector:
                 "notches": [],
             }
 
-        contour = self._choose_brick_contour(contours)
+        contour = self._choose_brick_contour(contours, mask.shape)
         if contour is None:
             draw_label(overlay, "brick: searching", 16, 32, (180, 190, 200))
             return overlay, {
@@ -591,19 +801,20 @@ class BrickDetector:
                 "notches": [],
             }
 
-        area = cv2.contourArea(contour)
-        x, y, w, h = cv2.boundingRect(contour)
+        x, y, w, h, body_area = self._solid_body_bbox(mask, contour, hsv)
+        area = float(body_area)
         extent = area / max(1, w * h)
         aspect = w / max(1, h)
-        notches = self._find_notches(mask, contour)
+        body_bbox = (x, y, w, h)
+        notches = self._find_notches(mask, contour, body_bbox)
         triangle_found = any(notch["type"] == "triangle-notch" for notch in notches)
         square_found = any(notch["type"] == "square-notch" for notch in notches)
         brick_shape = 0.45 <= extent <= 0.9 and 0.55 <= aspect <= 1.55 and w >= 80 and h >= 80
-        spatial = self._estimate_spatial(mask, contour, depth, intrinsics)
+        spatial = self._estimate_spatial(mask, contour, depth, intrinsics, body_bbox)
 
         now = time.monotonic()
         if now - self.last_hex_sample_t >= HEX_SAMPLE_PERIOD_S or not self.hex_colors:
-            self.hex_colors = self._sample_hex_colors(frame, mask, contour)
+            self.hex_colors = self._sample_hex_colors(frame, mask, contour, body_bbox)
             self.last_hex_sample_t = now
 
         color_score = min(1.0, area / 22000.0)
@@ -617,7 +828,6 @@ class BrickDetector:
             + 0.20 * square_score
         )))
 
-        cv2.drawContours(overlay, [contour], -1, (45, 230, 120), 2)
         cv2.rectangle(overlay, (x, y), (x + w, y + h), (45, 230, 120), 2)
         draw_label(overlay, f"brick {confidence}%", x, max(24, y - 8), (45, 230, 120))
         if intrinsics is not None:
@@ -634,6 +844,8 @@ class BrickDetector:
             draw_label(overlay, "depth: waiting", x, y + h + 24, (0, 255, 255))
 
         for notch in notches:
+            if notch["type"] == "negative-space":
+                continue
             bbox = notch["bbox"]
             if notch["type"] == "triangle-notch":
                 color = (0, 220, 255)
@@ -947,11 +1159,21 @@ def main():
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help=f"stream width (default {DEFAULT_WIDTH})")
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT, help=f"stream height (default {DEFAULT_HEIGHT})")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help=f"camera FPS (default {DEFAULT_FPS:g})")
+    parser.add_argument(
+        "--device-wait",
+        type=float,
+        default=DEVICE_WAIT_S,
+        help=f"seconds to wait for the OAK to appear on USB (default {DEVICE_WAIT_S:g})",
+    )
     args = parser.parse_args()
 
-    devices = dai.Device.getAllAvailableDevices()
+    devices = wait_for_device(args.device_wait)
     if not devices:
-        print("[vision] no DepthAI/OAK device found on USB", file=sys.stderr)
+        print(
+            f"[vision] no DepthAI/OAK device found on USB after {args.device_wait:g}s "
+            "(check the cable / replug into a USB3 port)",
+            file=sys.stderr,
+        )
         return 1
 
     print("[vision] available DepthAI devices:")

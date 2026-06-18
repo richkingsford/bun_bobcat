@@ -1,0 +1,5 @@
+{"attempt_seconds": 7.0, "attempts": 1, "event": "game_start", "gate_mm": 10, "target": {"dist": 261, "x": 0, "y": -60}, "ts": "2026-05-28T20:52:53Z"}
+{"attempt": 1, "event": "attempt_start", "ts": "2026-05-28T20:52:55Z", "wins": 0}
+{"attempt": 1, "error": {"dist": 333, "x": -33, "y": -10}, "event": "sample", "reading": {"confidence": 26, "dist": 594, "source": "avg:stereo", "x": -33, "y": -70}, "step": 0, "ts": "2026-05-28T20:52:55Z"}
+{"action": "approach_straight", "attempt": 1, "command": {"left": -100, "mast": 0, "right": -100, "seconds": 0.333}, "error": {"dist": 333, "x": -33, "y": -10}, "event": "action", "reading": {"confidence": 26, "dist": 594, "source": "avg:stereo", "x": -33, "y": -70}, "step": 0, "ts": "2026-05-28T20:52:55Z"}
+{"attempt": 1, "event": "lost_vision", "step": 1, "ts": "2026-05-28T20:52:56Z"}

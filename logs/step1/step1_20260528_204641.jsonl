@@ -1,0 +1,2 @@
+{"attempt_seconds": 7.0, "attempts": 1, "event": "game_start", "gate_mm": 10, "target": {"dist": 261, "x": 0, "y": -60}, "ts": "2026-05-28T20:46:41Z"}
+{"event": "abort_no_vision", "ts": "2026-05-28T20:46:42Z"}

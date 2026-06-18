@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import time
 
+from host_controller import DEFAULT_PORT, SERIAL_BAUD, SerialLink
+
 
 DEFAULT_ROUTER_SOCKET = "/var/run/arduino-router.sock"
 DEFAULT_SECONDS = 0.5
@@ -40,35 +42,59 @@ def pause_after_coast(seconds):
         time.sleep(seconds)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Wiggle Bun's treads forward/back, then D10 mast servo up/down."
-    )
-    parser.add_argument("--seconds", type=float, default=DEFAULT_SECONDS,
-                        help="seconds to hold each direction (default 0.5 = 500 ms)")
-    parser.add_argument("--power", type=int, default=DEFAULT_POWER,
-                        help="speed magnitude 0-100 (default 100)")
-    parser.add_argument("--cycles", type=int, default=1,
-                        help="number of forward/back wiggle cycles")
-    parser.add_argument("--pause", type=float, default=0.1,
-                        help="coast pause between direction changes")
-    parser.add_argument("--mast-only", action="store_true",
-                        help="only move the D10 mast servo up/down")
-    parser.add_argument("--router-socket", default=DEFAULT_ROUTER_SOCKET,
-                        help=f"App Lab router socket (default {DEFAULT_ROUTER_SOCKET})")
-    args = parser.parse_args()
+def wiggle_steps(power, mast_only):
+    steps = []
+    if not mast_only:
+        steps.extend([
+            ("left tread forward", power, 0, 0),
+            ("left tread backward", -power, 0, 0),
+            ("right tread forward", 0, power, 0),
+            ("right tread backward", 0, -power, 0),
+        ])
+    steps.extend([
+        ("mast positive", 0, 0, power),
+        ("mast negative", 0, 0, -power),
+    ])
+    return steps
 
-    if args.seconds <= 0:
-        parser.error("--seconds must be positive")
-    if args.cycles <= 0:
-        parser.error("--cycles must be positive")
-    if args.pause < 0:
-        parser.error("--pause must be non-negative")
 
-    power = clamp_power(args.power)
-    if power == 0:
-        parser.error("--power must be greater than 0")
+def run_serial_wiggle(args, power):
+    link = SerialLink(args.port, args.baud)
+    if not link.connect():
+        print(f"[wiggle] serial transport is not ready at {args.port}", file=sys.stderr)
+        return 1
 
+    def hold(left, right, mast, seconds):
+        end_t = time.monotonic() + seconds
+        while True:
+            link.send(left, right, mast)
+            remaining = end_t - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(COMMAND_PERIOD_S, remaining))
+
+    try:
+        for cycle in range(args.cycles):
+            if args.cycles > 1:
+                print(f"[wiggle] cycle {cycle + 1}/{args.cycles}")
+
+            steps = wiggle_steps(power, args.mast_only)
+
+            for index, (label, left, right, mast) in enumerate(steps):
+                print(f"[wiggle] {label} for {args.seconds:.2f}s")
+                hold(left, right, mast, args.seconds)
+                link.coast()
+                if cycle != args.cycles - 1 or index != len(steps) - 1:
+                    pause_after_coast(args.pause)
+    finally:
+        link.coast()
+        link.close()
+
+    print("[wiggle] done; motors coasting and mast neutral")
+    return 0
+
+
+def run_rpc_wiggle(args, power):
     if not Path(args.router_socket).exists():
         print(f"[wiggle] router socket not found at {args.router_socket}", file=sys.stderr)
         print("[wiggle] run this on the UNO Q/App Lab host with the router active.", file=sys.stderr)
@@ -95,32 +121,57 @@ def main():
             if args.cycles > 1:
                 print(f"[wiggle] cycle {cycle + 1}/{args.cycles}")
 
-            if not args.mast_only:
-                print(f"[wiggle] treads forward for {args.seconds:.2f}s")
-                hold_drive(Bridge, power, power, 0, args.seconds)
+            steps = wiggle_steps(power, args.mast_only)
+            for index, (label, left, right, mast) in enumerate(steps):
+                print(f"[wiggle] {label} for {args.seconds:.2f}s")
+                hold_drive(Bridge, left, right, mast, args.seconds)
                 coast(Bridge)
-                pause_after_coast(args.pause)
-
-                print(f"[wiggle] treads backward for {args.seconds:.2f}s")
-                hold_drive(Bridge, -power, -power, 0, args.seconds)
-                coast(Bridge)
-                pause_after_coast(args.pause)
-
-            print(f"[wiggle] mast up for {args.seconds:.2f}s")
-            hold_drive(Bridge, 0, 0, power, args.seconds)
-            coast(Bridge)
-            pause_after_coast(args.pause)
-
-            print(f"[wiggle] mast down for {args.seconds:.2f}s")
-            hold_drive(Bridge, 0, 0, -power, args.seconds)
-            coast(Bridge)
-            if cycle != args.cycles - 1:
-                pause_after_coast(args.pause)
+                if cycle != args.cycles - 1 or index != len(steps) - 1:
+                    pause_after_coast(args.pause)
     finally:
         coast(Bridge)
 
     print("[wiggle] done; motors coasting and mast neutral")
     return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Wiggle Bun's treads forward/back, then D10 mast servo up/down."
+    )
+    parser.add_argument("--transport", choices=("serial", "rpc"), default="rpc",
+                        help="movement transport (default rpc)")
+    parser.add_argument("--port", default=DEFAULT_PORT,
+                        help=f"serial port for --transport serial (default {DEFAULT_PORT})")
+    parser.add_argument("--baud", type=int, default=SERIAL_BAUD)
+    parser.add_argument("--seconds", type=float, default=DEFAULT_SECONDS,
+                        help=f"seconds to hold each direction (default {DEFAULT_SECONDS:g})")
+    parser.add_argument("--power", type=int, default=DEFAULT_POWER,
+                        help=f"speed magnitude 0-100 (default {DEFAULT_POWER})")
+    parser.add_argument("--cycles", type=int, default=1,
+                        help="number of forward/back wiggle cycles")
+    parser.add_argument("--pause", type=float, default=0.1,
+                        help="coast pause between direction changes")
+    parser.add_argument("--mast-only", action="store_true",
+                        help="only move the D10 mast servo up/down")
+    parser.add_argument("--router-socket", default=DEFAULT_ROUTER_SOCKET,
+                        help=f"App Lab router socket (default {DEFAULT_ROUTER_SOCKET})")
+    args = parser.parse_args()
+
+    if args.seconds <= 0:
+        parser.error("--seconds must be positive")
+    if args.cycles <= 0:
+        parser.error("--cycles must be positive")
+    if args.pause < 0:
+        parser.error("--pause must be non-negative")
+
+    power = clamp_power(args.power)
+    if power == 0:
+        parser.error("--power must be greater than 0")
+
+    if args.transport == "serial":
+        return run_serial_wiggle(args, power)
+    return run_rpc_wiggle(args, power)
 
 
 if __name__ == "__main__":

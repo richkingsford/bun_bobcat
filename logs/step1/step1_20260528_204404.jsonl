@@ -1,0 +1,9 @@
+{"attempt_seconds": 7.0, "attempts": 1, "event": "game_start", "gate_mm": 10, "target": {"dist": 261, "x": 0, "y": -60}, "ts": "2026-05-28T20:44:04Z"}
+{"attempt": 1, "event": "attempt_start", "ts": "2026-05-28T20:44:05Z", "wins": 0}
+{"attempt": 1, "error": {"dist": 259, "x": 66, "y": 1}, "event": "sample", "reading": {"confidence": 41, "dist": 520, "source": "avg:stereo", "x": 66, "y": -59}, "step": 0, "ts": "2026-05-28T20:44:05Z"}
+{"action": "lane_x_down", "attempt": 1, "command": {"left": 100, "mast": 0, "right": -100, "seconds": 0.22}, "error": {"dist": 259, "x": 66, "y": 1}, "event": "action", "reading": {"confidence": 41, "dist": 520, "source": "avg:stereo", "x": 66, "y": -59}, "step": 0, "ts": "2026-05-28T20:44:05Z"}
+{"attempt": 1, "error": {"dist": 259, "x": 66, "y": 1}, "event": "sample", "reading": {"confidence": 49, "dist": 520, "source": "avg:stereo", "x": 66, "y": -59}, "step": 1, "ts": "2026-05-28T20:44:06Z"}
+{"action": "lane_x_down", "attempt": 1, "command": {"left": 100, "mast": 0, "right": -100, "seconds": 0.22}, "error": {"dist": 259, "x": 66, "y": 1}, "event": "action", "reading": {"confidence": 49, "dist": 520, "source": "avg:stereo", "x": 66, "y": -59}, "step": 1, "ts": "2026-05-28T20:44:06Z"}
+{"attempt": 1, "error": {"dist": 260, "x": 66, "y": 0}, "event": "sample", "reading": {"confidence": 61, "dist": 521, "source": "avg:stereo", "x": 66, "y": -60}, "step": 2, "ts": "2026-05-28T20:44:06Z"}
+{"action": "lane_x_down", "attempt": 1, "command": {"left": 100, "mast": 0, "right": -100, "seconds": 0.22}, "error": {"dist": 260, "x": 66, "y": 0}, "event": "action", "reading": {"confidence": 61, "dist": 521, "source": "avg:stereo", "x": 66, "y": -60}, "step": 2, "ts": "2026-05-28T20:44:06Z"}
+{"attempt": 1, "event": "lost_vision", "step": 3, "ts": "2026-05-28T20:44:07Z"}
